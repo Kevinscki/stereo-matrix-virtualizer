@@ -104,6 +104,14 @@ not affiliated with, endorsed by, or an implementation licensed by Dolby
 Laboratories or DTS, Inc. Dolby and DTS names that may appear in user-supplied
 HRIR filenames remain the property of their respective owners.
 
+## Bug Reporting
+
+If you encounter any issues, please:
+- Open a GitHub Issue in the [Issues tab](https://github.com/Kevinscki/stereo-matrix-virtualizer/issues).
+- Or send a detailed report to [kelvinrutatina@gmail.com](mailto:kelvinrutatina@gmail.com).
+
+Please include your system logs and the specific PipeWire version you are using.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
