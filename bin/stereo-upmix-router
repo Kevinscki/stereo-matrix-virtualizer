@@ -1,0 +1,294 @@
+#!/usr/bin/python3
+"""Keep the selected global processing path connected and authoritative."""
+
+from __future__ import annotations
+
+import json
+import signal
+import subprocess
+import time
+from pathlib import Path
+
+
+STATE = Path.home() / ".config/stereo-matrix-virtualizer/route.json"
+MATRIX = "effect_input.stereo-matrix-upmix"
+MATRIX_OUTPUT = "effect_output.stereo-matrix-upmix"
+SURROUND = "effect_input.virtual-surround-manager"
+SURROUND_OUTPUT = "effect_output.virtual-surround-manager"
+CHANNELS_7_1 = ("FL", "FR", "FC", "LFE", "RL", "RR", "SL", "SR")
+CHANNELS_STEREO = ("FL", "FR")
+MODES = {"matrix", "hrir", "both"}
+
+
+def run(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
+def wpctl(*args: str) -> None:
+    run("wpctl", *args)
+
+
+def props(item: dict) -> dict:
+    return item.get("info", {}).get("props", {})
+
+
+def node_named(nodes: list[dict], name: str) -> dict | None:
+    return next((node for node in nodes if props(node).get("node.name") == name), None)
+
+
+def node_id(node: dict | None) -> int | None:
+    return int(node["id"]) if node else None
+
+
+def read_state() -> dict:
+    try:
+        value = json.loads(STATE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+
+def write_state(value: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = STATE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(STATE)
+
+
+def physical_sink(nodes: list[dict], name: str) -> dict | None:
+    node = node_named(nodes, name)
+    if not node:
+        return None
+    node_props = props(node)
+    if (
+        node_props.get("media.class") == "Audio/Sink"
+        and not str(node_props.get("node.name", "")).startswith("effect_input.")
+    ):
+        return node
+    return None
+
+
+def port_map(ports: list[dict], wanted_node: int, direction: str) -> dict[str, tuple[str, int]]:
+    result: dict[str, tuple[str, int]] = {}
+    for port in ports:
+        info = port.get("info", {})
+        port_props = info.get("props", {})
+        if int(port_props.get("node.id", -1)) != wanted_node or info.get("direction") != direction:
+            continue
+        channel = port_props.get("audio.channel")
+        alias = port_props.get("port.alias")
+        if channel and alias:
+            result[str(channel)] = (str(alias), int(port["id"]))
+    return result
+
+
+def disconnect_output(output_id: int, target_id: int | None, links: list[dict]) -> None:
+    for link in links:
+        link_props = props(link)
+        if (
+            int(link_props.get("link.output.node", -1)) == output_id
+            and (
+                target_id is None
+                or int(link_props.get("link.input.node", -1)) != target_id
+            )
+        ):
+            run("pw-cli", "destroy", str(link["id"]))
+
+
+def ensure_route(
+    output: dict | None,
+    target: dict | None,
+    channels: tuple[str, ...],
+    ports: list[dict],
+    links: list[dict],
+) -> bool:
+    """Create a complete replacement route before removing the old route."""
+    output_id, target_id = node_id(output), node_id(target)
+    if output_id is None or target_id is None:
+        return False
+    outputs = port_map(ports, output_id, "output")
+    inputs = port_map(ports, target_id, "input")
+    existing = {
+        (int(props(link).get("link.output.port", -1)), int(props(link).get("link.input.port", -1)))
+        for link in links
+        if link.get("info", {}).get("state") != "error"
+    }
+    desired: set[tuple[int, int]] = set()
+    for channel in channels:
+        if channel not in outputs or channel not in inputs:
+            continue
+        output_alias, output_port = outputs[channel]
+        input_alias, input_port = inputs[channel]
+        desired.add((output_port, input_port))
+        if (output_port, input_port) not in existing:
+            run("pw-link", output_alias, input_alias)
+    if not desired or not desired.issubset(existing):
+        # Observe the newly created links on the next graph snapshot before
+        # removing anything from the last known-good path.
+        return False
+    disconnect_output(output_id, target_id, links)
+    return True
+
+
+def applications_routed(target: dict, nodes: list[dict], links: list[dict]) -> bool:
+    target_id = node_id(target)
+    if target_id is None:
+        return False
+    for stream in nodes:
+        stream_props = props(stream)
+        if (
+            stream_props.get("media.class") != "Stream/Output/Audio"
+            or str(stream_props.get("node.name", "")).startswith("effect_output.")
+        ):
+            continue
+        stream_id = node_id(stream)
+        if stream_id is None:
+            continue
+        linked_targets = {
+            int(props(link).get("link.input.node", -1))
+            for link in links
+            if int(props(link).get("link.output.node", -1)) == stream_id
+        }
+        if linked_targets and linked_targets != {target_id}:
+            return False
+    return True
+
+
+def route_applications(
+    target: dict | None,
+    nodes: list[dict],
+    ports: list[dict],
+    links: list[dict],
+) -> None:
+    """Keep ordinary playback streams on the selected processing sink."""
+    target_id = node_id(target)
+    if target_id is None:
+        return
+    target_name = str(props(target).get("node.name", ""))
+    if not target_name:
+        return
+
+    for stream in nodes:
+        stream_props = props(stream)
+        stream_name = str(stream_props.get("node.name", ""))
+        if (
+            stream_props.get("media.class") != "Stream/Output/Audio"
+            or stream_name.startswith("effect_output.")
+        ):
+            continue
+        stream_id = node_id(stream)
+        if stream_id is None:
+            continue
+        linked_targets = {
+            int(props(link).get("link.input.node", -1))
+            for link in links
+            if int(props(link).get("link.output.node", -1)) == stream_id
+        }
+        if linked_targets and linked_targets == {target_id}:
+            continue
+
+        serial = stream_props.get("object.serial")
+        if serial is not None:
+            moved = run("pactl", "move-sink-input", str(serial), target_name)
+            if moved.returncode == 0:
+                continue
+
+        run("pw-metadata", "-n", "default", "-d", str(stream_id), "target.node")
+        run(
+            "pw-metadata", "-n", "default", str(stream_id),
+            "target.object", target_name, "Spa:String:JSON",
+        )
+        ensure_route(
+            stream,
+            target,
+            tuple(port_map(ports, stream_id, "output")),
+            ports,
+            links,
+        )
+
+
+def main() -> None:
+    running = True
+
+    def stop(_signum: int, _frame: object) -> None:
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    while running:
+        dump_result = run("pw-dump")
+        try:
+            objects = json.loads(dump_result.stdout)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            time.sleep(0.5)
+            continue
+
+        nodes = [item for item in objects if item.get("type") == "PipeWire:Interface:Node"]
+        ports = [item for item in objects if item.get("type") == "PipeWire:Interface:Port"]
+        links = [item for item in objects if item.get("type") == "PipeWire:Interface:Link"]
+        state = read_state()
+        raw_mode = str(state.get("mode", "both"))
+        mode = {"stereo": "both", "native": "hrir"}.get(raw_mode, raw_mode)
+        if mode not in MODES:
+            mode = "both"
+
+        default_name = run("pactl", "get-default-sink").stdout.strip()
+        selected_physical = physical_sink(nodes, default_name)
+        if selected_physical and default_name != state.get("sink_name"):
+            state["sink_name"] = default_name
+            state["mode"] = mode
+            state.pop("app_routes", None)
+            write_state(state)
+
+        hardware = physical_sink(nodes, str(state.get("sink_name", "")))
+        if not hardware:
+            time.sleep(0.5)
+            continue
+
+        # The processing sinks are application targets, never hardware
+        # defaults. Repair KDE/WirePlumber choosing one as the system default.
+        if default_name in {MATRIX, SURROUND}:
+            run("pactl", "set-default-sink", str(props(hardware).get("node.name", "")))
+
+        if not bool(state.get("enabled", False)):
+            route_applications(hardware, nodes, ports, links)
+            time.sleep(0.5)
+            continue
+
+        matrix = node_named(nodes, MATRIX)
+        surround = node_named(nodes, SURROUND)
+        if not matrix or not surround:
+            time.sleep(0.5)
+            continue
+
+        hrir_output_ready = ensure_route(
+            node_named(nodes, SURROUND_OUTPUT), hardware, CHANNELS_STEREO, ports, links
+        )
+        if not hrir_output_ready:
+            time.sleep(0.5)
+            continue
+
+        matrix_output = node_named(nodes, MATRIX_OUTPUT)
+        if mode == "both":
+            # Prepare Matrix -> HRIR completely before moving applications.
+            if ensure_route(matrix_output, surround, CHANNELS_7_1, ports, links):
+                route_applications(matrix, nodes, ports, links)
+        elif mode == "matrix":
+            # Matrix-only is valid only for a real 7.1 hardware destination.
+            if ensure_route(matrix_output, hardware, CHANNELS_7_1, ports, links):
+                route_applications(matrix, nodes, ports, links)
+        else:
+            # Move applications to the already-live HRIR path first. Only once
+            # the new route is observed do we disconnect the idle Matrix output.
+            route_applications(surround, nodes, ports, links)
+            if applications_routed(surround, nodes, links):
+                matrix_output_id = node_id(matrix_output)
+                if matrix_output_id is not None:
+                    disconnect_output(matrix_output_id, None, links)
+
+        time.sleep(0.5)
+
+
+if __name__ == "__main__":
+    main()

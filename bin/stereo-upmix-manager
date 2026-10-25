@@ -1,0 +1,949 @@
+#!/usr/bin/python3
+"""Qt frontend for the native PipeWire stereo upmixer and HRIR renderer."""
+
+from __future__ import annotations
+
+import configparser
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from PySide6.QtCore import QLockFile, QTimer, Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QFont
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSlider,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+APP_ID = "de.berny23.virtual_surround_manager"
+UPMIX_SERVICE = "stereo-upmix-manager.service"
+HRIR_SERVICE = "virtual-surround-manager.service"
+ROUTER_SERVICE = "stereo-upmix-router.service"
+UPMIX_NODE = "effect_input.stereo-matrix-upmix"
+HRIR_NODE = "effect_input.virtual-surround-manager"
+
+EQ_PRESET_NAME = "Stereo Upmix 16-band EQ"
+EQ_FREQUENCIES = (20, 31.5, 63, 125, 250, 500, 1000, 2000, 3000, 4000, 6000, 8000, 10000, 12000, 16000, 20000)
+
+HOME = Path.home()
+XDG_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share"))
+VSM_ROOT = HOME / ".var" / "app" / APP_ID
+APP_CONFIG = HOME / ".config" / "stereo-matrix-virtualizer"
+APP_DATA = XDG_DATA_HOME / "stereo-matrix-virtualizer"
+HRIR_DIR = APP_DATA / "hrir"
+LEGACY_HRIR_DIR = VSM_ROOT / "data" / "virtual-surround-manager" / "hrir_wav"
+HRIR_DIRS = (HRIR_DIR, LEGACY_HRIR_DIR)
+SETTINGS = APP_CONFIG / "settings.ini"
+LEGACY_VSM_CONFIG = VSM_ROOT / "config" / "virtual-surround-manager"
+EQ_STATE = APP_CONFIG / "eq.json"
+EQ_PIPEWIRE_CONFIG = APP_CONFIG / "eq-filter.conf"
+FILTER_BUILDER = HOME / ".local" / "libexec" / "stereo-upmix-build-filter"
+ROUTE_STATE = APP_CONFIG / "route.json"
+EQ_PRESET_DIRS = (
+    HOME / ".config" / "easyeffects" / "output",
+    HOME / ".var" / "app" / "com.github.wwmm.easyeffects" / "data" / "easyeffects" / "output",
+)
+LEGACY_FILES = (
+    HOME / ".config" / "pipewire" / "pipewire.conf.d" / "virtual-surround.conf",
+    HOME / ".config" / "pipewire" / "pipewire-pulse.conf.d" / "20-upmix.conf",
+)
+
+
+def run(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def service_active(name: str) -> bool:
+    return run("systemctl", "--user", "is-active", "--quiet", name).returncode == 0
+
+
+def set_service(name: str, enabled: bool) -> None:
+    action = "enable" if enabled else "disable"
+    state = "--now"
+    result = run("systemctl", "--user", action, state, name)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or f"Could not change {name}")
+
+
+def pipewire_node_present(name: str) -> bool:
+    dump = run("pw-dump")
+    return dump.returncode == 0 and f'"{name}"' in dump.stdout
+
+
+def pipewire_objects() -> list[dict]:
+    result = run("pw-dump")
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "Could not inspect PipeWire.")
+    return json.loads(result.stdout)
+
+
+def audio_nodes(objects: list[dict]) -> list[dict]:
+    return [item for item in objects if item.get("type") == "PipeWire:Interface:Node"]
+
+
+def node_props(node: dict) -> dict:
+    return node.get("info", {}).get("props", {})
+
+
+def current_default_sink(objects: list[dict]) -> dict | None:
+    result = run("wpctl", "inspect", "@DEFAULT_AUDIO_SINK@")
+    match = re.search(r"^id (\d+),", result.stdout, re.MULTILINE)
+    if not match:
+        return None
+    node_id = int(match.group(1))
+    return next((node for node in audio_nodes(objects) if node.get("id") == node_id), None)
+
+
+def route_streams(
+    target: dict,
+    objects: list[dict],
+    *,
+    surround_target: dict | None = None,
+) -> None:
+    target_id = int(target["id"])
+    target_name = str(node_props(target).get("node.name", ""))
+    if not target_name:
+        raise RuntimeError("The selected audio target has no PipeWire node name.")
+
+    links = [item for item in objects if item.get("type") == "PipeWire:Interface:Link"]
+    ports = [item for item in objects if item.get("type") == "PipeWire:Interface:Port"]
+    for stream in audio_nodes(objects):
+        props = node_props(stream)
+        name = str(props.get("node.name", ""))
+        if props.get("media.class") != "Stream/Output/Audio" or name.startswith("effect_output."):
+            continue
+        stream_id = int(stream["id"])
+        channel_count = sum(
+            1 for port in ports
+            if port.get("info", {}).get("props", {}).get("node.id") == stream_id
+            and port.get("info", {}).get("direction") == "output"
+        )
+        stream_target = surround_target if surround_target and channel_count > 2 else target
+        stream_target_id = int(stream_target["id"])
+        stream_target_name = str(node_props(stream_target).get("node.name", ""))
+        serial = props.get("object.serial")
+        if serial is not None:
+            moved = run("pactl", "move-sink-input", str(serial), stream_target_name)
+            if moved.returncode == 0:
+                continue
+        run("pw-metadata", "-n", "default", "-d", str(stream_id), "target.node")
+        result = run(
+            "pw-metadata", "-n", "default", str(stream_id),
+            "target.object", stream_target_name, "Spa:String:JSON",
+        )
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or f"Could not route {name or stream_id}.")
+        for link in links:
+            link_props = link.get("info", {}).get("props", {})
+            if (
+                link_props.get("link.output.node") == stream_id
+                and link_props.get("link.input.node") != stream_target_id
+            ):
+                run("pw-cli", "destroy", str(link["id"]))
+        # Passive virtual sinks do not always trigger WirePlumber to recreate
+        # an application link after target metadata changes. Link matching
+        # channel ports explicitly for the managed matrix/VSM sinks.
+        if stream_target_name == UPMIX_NODE or (
+            stream_target_name == HRIR_NODE and channel_count > 2
+        ):
+            output_ports = [
+                port for port in ports
+                if port.get("info", {}).get("props", {}).get("node.id") == stream_id
+                and port.get("info", {}).get("direction") == "output"
+            ]
+            input_ports = [
+                port for port in ports
+                if port.get("info", {}).get("props", {}).get("node.id") == stream_target_id
+                and port.get("info", {}).get("direction") == "input"
+            ]
+            for output_port in output_ports:
+                output_props = output_port.get("info", {}).get("props", {})
+                channel = output_props.get("audio.channel")
+                input_port = next(
+                    (
+                        port for port in input_ports
+                        if port.get("info", {}).get("props", {}).get("audio.channel") == channel
+                    ),
+                    None,
+                )
+                if input_port:
+                    input_props = input_port.get("info", {}).get("props", {})
+                    run("pw-link", str(output_props.get("port.alias")), str(input_props.get("port.alias")))
+
+
+def physical_fallback(objects: list[dict]) -> dict | None:
+    nodes = audio_nodes(objects)
+    try:
+        saved = json.loads(ROUTE_STATE.read_text(encoding="utf-8"))
+        saved_name = saved.get("sink_name", "")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        saved_name = ""
+    if saved_name:
+        match = next((node for node in nodes if node_props(node).get("node.name") == saved_name), None)
+        if match:
+            return match
+
+    candidates = [
+        node for node in nodes
+        if node_props(node).get("media.class") == "Audio/Sink"
+        and not str(node_props(node).get("node.name", "")).startswith("effect_input.")
+        and "device.id" in node_props(node)
+    ]
+    return max(candidates, key=lambda node: int(node_props(node).get("priority.session", 0)), default=None)
+
+
+def physical_outputs(objects: list[dict]) -> list[tuple[str, str]]:
+    outputs = []
+    for node in audio_nodes(objects):
+        props = node_props(node)
+        name = str(props.get("node.name", ""))
+        if (
+            props.get("media.class") == "Audio/Sink"
+            and not name.startswith("effect_input.")
+            and "device.id" in props
+        ):
+            description = str(props.get("node.description") or props.get("device.description") or name)
+            outputs.append((name, description))
+    return sorted(outputs, key=lambda item: item[1].casefold())
+
+
+def wait_for_audio_node(name: str, timeout: float = 5.0) -> tuple[dict, list[dict]]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        objects = pipewire_objects()
+        node = next(
+            (item for item in audio_nodes(objects) if node_props(item).get("node.name") == name),
+            None,
+        )
+        if node:
+            return node, objects
+        time.sleep(0.1)
+    raise RuntimeError(f"Audio node did not return after WirePlumber reload: {name}")
+
+
+def read_route_state() -> dict:
+    try:
+        value = json.loads(ROUTE_STATE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+
+def normalized_mode(value: object) -> str:
+    mode = {"stereo": "both", "native": "hrir"}.get(str(value), str(value))
+    return mode if mode in {"matrix", "hrir", "both"} else "both"
+
+
+def volume_state(node: dict | None) -> tuple[float, bool]:
+    if not node:
+        return 1.0, False
+    result = run("wpctl", "get-volume", str(node["id"]))
+    match = re.search(r"Volume:\s+([0-9.]+)", result.stdout)
+    return (float(match.group(1)) if match else 1.0, "[MUTED]" in result.stdout)
+
+
+def set_volume_state(node: dict | None, volume: float, muted: bool) -> None:
+    if not node:
+        return
+    run("wpctl", "set-volume", str(node["id"]), str(volume))
+    run("wpctl", "set-mute", str(node["id"]), "1" if muted else "0")
+
+
+def read_selected_profile() -> Path | None:
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(SETTINGS if SETTINGS.exists() else LEGACY_VSM_CONFIG)
+        value = parser.get("Settings", "hrir_wav_file_path", fallback="")
+        return Path(value) if value else None
+    except (OSError, configparser.Error):
+        return None
+
+
+def write_selected_profile(profile: Path, auto_enabled: bool | None = None) -> None:
+    allowed_directories = {directory.resolve() for directory in HRIR_DIRS if directory.exists()}
+    if (
+        profile.suffix.lower() != ".wav"
+        or not profile.is_file()
+        or profile.resolve().parent not in allowed_directories
+    ):
+        raise ValueError("The selected HRIR is not a WAV file in a configured profile directory.")
+
+    parser = configparser.ConfigParser()
+    parser.optionxform = str
+    if SETTINGS.exists():
+        parser.read(SETTINGS)
+    if not parser.has_section("Settings"):
+        parser.add_section("Settings")
+    parser.set("Settings", "channels", "7.1")
+    parser.set("Settings", "hrir_wav_file_path", str(profile))
+    parser.set("Settings", "startup_ui", "showTrayHideWindow")
+    if auto_enabled is not None:
+        parser.set(
+            "Settings",
+            "virtual_surround_auto_enabled",
+            "true" if auto_enabled else "false",
+        )
+
+    SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    temporary = SETTINGS.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        parser.write(stream, space_around_delimiters=False)
+    os.replace(temporary, SETTINGS)
+
+
+def hrir_profiles() -> list[Path]:
+    return sorted(
+        {profile.resolve() for directory in HRIR_DIRS for profile in directory.glob("*.wav")},
+        key=lambda item: item.name.casefold(),
+    )
+
+
+def read_eq_state() -> tuple[float, list[float], bool]:
+    defaults = [0.0] * len(EQ_FREQUENCIES)
+    defaults[0] = 1.0
+    defaults[-1] = 1.0
+    try:
+        data = json.loads(EQ_STATE.read_text(encoding="utf-8"))
+        gains = [float(value) for value in data.get("gains", defaults)]
+        if len(gains) != len(EQ_FREQUENCIES):
+            gains = defaults
+        return float(data.get("preamp", -3.0)), gains, bool(data.get("enabled", True))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return -3.0, defaults, True
+
+
+def write_eq_preset(preamp: float, gains: list[float], enabled: bool = True) -> None:
+    if len(gains) != len(EQ_FREQUENCIES):
+        raise ValueError("The EQ must contain exactly 16 bands.")
+
+    bands = {}
+    for index, (frequency, gain) in enumerate(zip(EQ_FREQUENCIES, gains, strict=True)):
+        bands[f"band{index}"] = {
+            "frequency": float(frequency),
+            "gain": float(gain),
+            "mode": "RLC (BT)",
+            "mute": False,
+            "q": 1.4,
+            "slope": "x1",
+            "solo": False,
+            "type": "Bell",
+        }
+
+    equalizer = {
+        "input-gain": float(preamp),
+        "left": bands,
+        "mode": "IIR",
+        "num-bands": len(EQ_FREQUENCIES),
+        "output-gain": 0.0,
+        "right": json.loads(json.dumps(bands)),
+        "split-channels": False,
+    }
+    limiter = {
+        "alr": False, "alr-attack": 5.0, "alr-knee": 0.0,
+        "alr-knee-smooth": -5.0, "alr-release": 50.0,
+        "attack": 1.0, "bypass": False, "dithering": "None",
+        "gain-boost": False, "input-gain": 0.0,
+        "input-to-link": -80.01, "input-to-sidechain": -80.01,
+        "link-to-input": -80.01, "link-to-sidechain": -80.01,
+        "lookahead": 5.0, "mode": "Herm Thin", "output-gain": 0.0,
+        "oversampling": "Half x2/24 bit", "release": 20.0,
+        "sidechain-preamp": 0.0, "sidechain-to-input": -80.01,
+        "sidechain-to-link": -80.01, "sidechain-type": "Internal",
+        "stereo-link": 100.0, "threshold": -1.0,
+    }
+    preset = {
+        "output": {
+            "blocklist": [],
+            "equalizer": equalizer,
+            "limiter#0": limiter,
+            "plugins_order": ["equalizer", "limiter#0"],
+        }
+    }
+
+    EQ_STATE.parent.mkdir(parents=True, exist_ok=True)
+    EQ_STATE.write_text(
+        json.dumps({"preamp": preamp, "gains": gains, "enabled": enabled}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    preset_text = json.dumps(preset, indent=2) + "\n"
+    for directory in EQ_PRESET_DIRS:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{EQ_PRESET_NAME}.json").write_text(preset_text, encoding="utf-8")
+
+    result = run(str(FILTER_BUILDER))
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "Could not build the native HRIR/EQ filter.")
+
+
+class UpmixWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self._updating = False
+        self.eq_preamp, self.eq_gains, self.eq_enabled = read_eq_state()
+        self.route_state = read_route_state()
+        HRIR_DIR.mkdir(parents=True, exist_ok=True)
+        if hrir_profiles():
+            write_eq_preset(self.eq_preamp, self.eq_gains, self.eq_enabled)
+        self.setWindowTitle("Stereo Matrix Virtualizer")
+        self.setMinimumWidth(880)
+        self._build_ui()
+        self.load_profiles()
+        self.refresh_status()
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh_status)
+        self.timer.start(2500)
+
+    def _build_ui(self) -> None:
+        central = QWidget()
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(14)
+
+        title = QLabel("Stereo Matrix Upmix + HRIR")
+        title_font = QFont()
+        title_font.setPointSize(17)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        layout.addWidget(title)
+
+        subtitle = QLabel(
+            "Choose one global PipeWire path for every application: matrix, HRIR, "
+            "both stages, or direct device passthrough."
+        )
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        layout.addWidget(line)
+
+        self.processing_toggle = QCheckBox("Enable processing for all applications")
+        self.processing_toggle.setToolTip(
+            "Off returns every application to the selected physical device."
+        )
+        self.processing_toggle.toggled.connect(self.toggle_processing)
+        layout.addWidget(self.processing_toggle)
+
+        output_row = QHBoxLayout()
+        output_row.addWidget(QLabel("Physical output"))
+        self.output_combo = QComboBox()
+        self.output_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.output_combo.activated.connect(self.physical_output_changed)
+        output_row.addWidget(self.output_combo, 1)
+        layout.addLayout(output_row)
+
+        route_row = QHBoxLayout()
+        route_row.addWidget(QLabel("Routing mode"))
+        self.route_mode = QComboBox()
+        self.route_mode.addItem("Matrix upscaler → HRIR virtualizer", "both")
+        self.route_mode.addItem("Matrix upscaler only (7.1 output)", "matrix")
+        self.route_mode.addItem("HRIR virtualizer only", "hrir")
+        selected_mode = normalized_mode(self.route_state.get("mode", "both"))
+        selected_index = self.route_mode.findData(selected_mode)
+        self.route_mode.setCurrentIndex(max(0, selected_index))
+        self.route_mode.currentIndexChanged.connect(self.route_mode_changed)
+        route_row.addWidget(self.route_mode)
+        route_row.addStretch()
+        layout.addLayout(route_row)
+
+        profile_label = QLabel("HRIR profile")
+        profile_label.setStyleSheet("font-weight: 600")
+        layout.addWidget(profile_label)
+
+        profile_row = QHBoxLayout()
+        self.profile_combo = QComboBox()
+        self.profile_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        profile_row.addWidget(self.profile_combo, 1)
+        self.apply_button = QPushButton("Apply profile")
+        self.apply_button.clicked.connect(self.apply_profile)
+        profile_row.addWidget(self.apply_button)
+        layout.addLayout(profile_row)
+
+        actions = QHBoxLayout()
+        open_button = QPushButton("Open WAV folder")
+        open_button.clicked.connect(self.open_hrir_folder)
+        actions.addWidget(open_button)
+        refresh_button = QPushButton("Refresh")
+        refresh_button.clicked.connect(self.load_profiles)
+        actions.addWidget(refresh_button)
+        self.legacy_button = QPushButton("Disable old global config")
+        self.legacy_button.clicked.connect(self.disable_legacy)
+        actions.addWidget(self.legacy_button)
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        eq_group = QGroupBox("16-band headphone-output EQ")
+        eq_layout = QVBoxLayout(eq_group)
+        self.eq_toggle = QCheckBox("Enable EQ in the HRIR renderer")
+        self.eq_toggle.toggled.connect(self.toggle_eq)
+        eq_layout.addWidget(self.eq_toggle)
+
+        preamp_row = QHBoxLayout()
+        preamp_row.addWidget(QLabel("Preamp / headroom"))
+        self.preamp = QDoubleSpinBox()
+        self.preamp.setRange(-18.0, 0.0)
+        self.preamp.setSingleStep(0.5)
+        self.preamp.setSuffix(" dB")
+        self.preamp.setValue(self.eq_preamp)
+        preamp_row.addWidget(self.preamp)
+        preamp_row.addStretch()
+        eq_layout.addLayout(preamp_row)
+
+        bands_row = QHBoxLayout()
+        bands_row.setSpacing(4)
+        self.eq_sliders: list[QSlider] = []
+        self.eq_value_labels: list[QLabel] = []
+        for index, frequency in enumerate(EQ_FREQUENCIES):
+            column = QVBoxLayout()
+            frequency_text = f"{frequency / 1000:g}k" if frequency >= 1000 else f"{frequency:g}"
+            name = QLabel(frequency_text)
+            name.setAlignment(Qt.AlignCenter)
+            slider = QSlider(Qt.Vertical)
+            slider.setRange(-24, 24)
+            slider.setSingleStep(1)
+            slider.setPageStep(2)
+            slider.setValue(round(self.eq_gains[index] * 2))
+            slider.setMinimumHeight(130)
+            value = QLabel(f"{self.eq_gains[index]:+.1f}")
+            value.setAlignment(Qt.AlignCenter)
+            slider.valueChanged.connect(lambda raw, label=value: label.setText(f"{raw / 2:+.1f}"))
+            column.addWidget(name)
+            column.addWidget(slider, alignment=Qt.AlignHCenter)
+            column.addWidget(value)
+            bands_row.addLayout(column, 1)
+            self.eq_sliders.append(slider)
+            self.eq_value_labels.append(value)
+        eq_layout.addLayout(bands_row)
+
+        eq_actions = QHBoxLayout()
+        apply_eq = QPushButton("Apply EQ")
+        apply_eq.clicked.connect(self.apply_eq)
+        eq_actions.addWidget(apply_eq)
+        flat_eq = QPushButton("Reset flat")
+        flat_eq.clicked.connect(self.reset_eq)
+        eq_actions.addWidget(flat_eq)
+        eq_actions.addStretch()
+        warning = QLabel("-3 dB headroom · 20 Hz +1 dB · 20 kHz +1 dB · limiter at -1 dB")
+        warning.setStyleSheet("color: palette(mid)")
+        eq_actions.addWidget(warning)
+        eq_layout.addLayout(eq_actions)
+        layout.addWidget(eq_group)
+
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.status.setStyleSheet(
+            "padding: 10px; border-radius: 5px; background: palette(alternate-base);"
+        )
+        layout.addWidget(self.status)
+
+        routing = QLabel(
+            "The selected mode applies globally; channel detection is intentionally "
+            "not used because applications can report misleading layouts. Matrix-only "
+            "is intended for a real 7.1 HDMI or S/PDIF endpoint."
+        )
+        routing.setWordWrap(True)
+        layout.addWidget(routing)
+
+        self.setCentralWidget(central)
+
+    def fail(self, title: str, exc: Exception | str) -> None:
+        QMessageBox.critical(self, title, str(exc))
+
+    def load_profiles(self) -> None:
+        current = read_selected_profile()
+        self.profile_combo.clear()
+        profiles = hrir_profiles()
+        for profile in profiles:
+            self.profile_combo.addItem(profile.stem, str(profile))
+        if current:
+            index = self.profile_combo.findData(str(current))
+            if index >= 0:
+                self.profile_combo.setCurrentIndex(index)
+        self.apply_button.setEnabled(bool(profiles))
+        self.refresh_status()
+
+    def refresh_outputs(self, objects: list[dict]) -> None:
+        outputs = physical_outputs(objects)
+        existing = [
+            (str(self.output_combo.itemData(index)), self.output_combo.itemText(index))
+            for index in range(self.output_combo.count())
+        ]
+        selected_name = str(read_route_state().get("sink_name", ""))
+        self._updating = True
+        if existing != outputs:
+            self.output_combo.clear()
+            for name, description in outputs:
+                self.output_combo.addItem(description, name)
+        selected_index = self.output_combo.findData(selected_name)
+        if selected_index >= 0:
+            self.output_combo.setCurrentIndex(selected_index)
+        self._updating = False
+
+    def physical_output_changed(self, _index: int) -> None:
+        if self._updating:
+            return
+        name = str(self.output_combo.currentData() or "")
+        if not name:
+            return
+        try:
+            objects = pipewire_objects()
+            output = next(
+                (node for node in audio_nodes(objects) if node_props(node).get("node.name") == name),
+                None,
+            )
+            if not output:
+                raise RuntimeError("The selected physical output is no longer available.")
+            state = read_route_state()
+            state["sink_name"] = name
+            temporary = ROUTE_STATE.with_suffix(".tmp")
+            temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            os.replace(temporary, ROUTE_STATE)
+            result = run("pactl", "set-default-sink", name)
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or "Could not select the physical output.")
+            if service_active(ROUTER_SERVICE):
+                time.sleep(0.6)
+            else:
+                route_streams(output, objects)
+            self.refresh_status()
+        except Exception as exc:
+            self.fail("Could not select physical output", exc)
+            self.refresh_status()
+
+    def restart_hrir_preserving_route(self) -> None:
+        """Restart HRIR while keeping current applications alive."""
+        state = read_route_state()
+        mode = normalized_mode(state.get("mode", "both"))
+        routed = service_active(ROUTER_SERVICE)
+        before = pipewire_objects()
+        hardware = physical_fallback(before)
+        if not hardware:
+            raise RuntimeError("No connected headphone or speaker output was found.")
+
+        # HRIR-only applications would lose their sink during replacement.
+        # Park them on hardware briefly; matrix+HRIR applications remain on
+        # the stable matrix input while only its downstream renderer restarts.
+        if routed and mode == "hrir":
+            route_streams(hardware, before)
+
+        result = run("systemctl", "--user", "restart", HRIR_SERVICE)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or "The native HRIR/EQ service could not restart.")
+
+        matrix = None
+        surround = None
+        objects: list[dict] = []
+        for _ in range(40):
+            objects = pipewire_objects()
+            matrix = next(
+                (node for node in audio_nodes(objects) if node_props(node).get("node.name") == UPMIX_NODE),
+                None,
+            )
+            surround = next(
+                (node for node in audio_nodes(objects) if node_props(node).get("node.name") == HRIR_NODE),
+                None,
+            )
+            if matrix and surround:
+                break
+            time.sleep(0.1)
+        if not matrix or not surround:
+            raise RuntimeError("The processing sinks did not return after the HRIR/EQ restart.")
+
+        if routed:
+            target = matrix if mode in {"matrix", "both"} else surround
+            set_volume_state(matrix, 1.0, False)
+            set_volume_state(surround, 1.0, False)
+            time.sleep(0.6)
+            route_streams(target, pipewire_objects())
+
+    def apply_profile(self) -> None:
+        value = self.profile_combo.currentData()
+        if not value:
+            return
+        try:
+            write_selected_profile(Path(value))
+            write_eq_preset(self.eq_preamp, self.eq_gains, self.eq_enabled)
+            if service_active(HRIR_SERVICE):
+                self.restart_hrir_preserving_route()
+            self.refresh_status()
+        except Exception as exc:  # surfaced to the GUI
+            self.fail("Could not apply HRIR profile", exc)
+
+    def toggle_processing(self, enabled: bool) -> None:
+        if self._updating:
+            return
+        if enabled:
+            self.apply_routing()
+        else:
+            self.stop_routing()
+
+    def route_mode_changed(self) -> None:
+        if not self._updating and service_active(ROUTER_SERVICE):
+            self.apply_routing()
+
+    def apply_routing(self) -> None:
+        router_was_active = service_active(ROUTER_SERVICE)
+        try:
+            if not service_active(UPMIX_SERVICE):
+                set_service(UPMIX_SERVICE, True)
+            if not service_active(HRIR_SERVICE):
+                set_service(HRIR_SERVICE, True)
+            matrix = None
+            surround = None
+            objects: list[dict] = []
+            for _ in range(20):
+                objects = pipewire_objects()
+                matrix = next(
+                    (node for node in audio_nodes(objects) if node_props(node).get("node.name") == UPMIX_NODE),
+                    None,
+                )
+                surround = next(
+                    (node for node in audio_nodes(objects) if node_props(node).get("node.name") == HRIR_NODE),
+                    None,
+                )
+                if matrix and surround:
+                    break
+                time.sleep(0.1)
+            if not matrix:
+                raise RuntimeError("The Stereo Matrix sink did not become ready.")
+            if not surround:
+                raise RuntimeError("Virtual Surround Manager did not become ready.")
+
+            current = current_default_sink(objects)
+            state = read_route_state()
+            if current and node_props(current).get("node.name") not in (UPMIX_NODE, HRIR_NODE):
+                current_name = node_props(current).get("node.name")
+                state["sink_name"] = current_name
+            mode = normalized_mode(self.route_mode.currentData())
+            state["mode"] = mode
+            state["enabled"] = True
+            state.pop("app_routes", None)
+            target = matrix if mode in {"matrix", "both"} else surround
+            hardware = physical_fallback(objects)
+            if not hardware:
+                raise RuntimeError("No connected headphone or speaker output was found.")
+            if mode == "matrix":
+                physical_channels = sum(
+                    1 for item in objects
+                    if item.get("type") == "PipeWire:Interface:Port"
+                    and item.get("info", {}).get("direction") == "input"
+                    and item.get("info", {}).get("props", {}).get("node.id") == int(hardware["id"])
+                )
+                if physical_channels < 8:
+                    raise RuntimeError(
+                        "Matrix-only requires a physical output currently exposing 7.1 channels. "
+                        f"The selected device exposes {physical_channels}."
+                    )
+            self.route_state = state
+            ROUTE_STATE.parent.mkdir(parents=True, exist_ok=True)
+            ROUTE_STATE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            set_volume_state(matrix, 1.0, False)
+            set_volume_state(surround, 1.0, False)
+            if not router_was_active:
+                set_service(ROUTER_SERVICE, True)
+            target_name = UPMIX_NODE if mode in {"matrix", "both"} else HRIR_NODE
+            # Live routing is owned entirely by the persistent router.
+            wait_for_audio_node(str(state["sink_name"]))
+            result = run("pactl", "set-default-sink", str(state["sink_name"]))
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or "Could not retain the physical default output.")
+            wait_for_audio_node(target_name)
+            self.refresh_status()
+        except Exception as exc:
+            if not router_was_active and service_active(ROUTER_SERVICE):
+                set_service(ROUTER_SERVICE, False)
+            self.fail("Could not enable audio processing", exc)
+            self.refresh_status()
+
+    def stop_routing(self) -> None:
+        try:
+            objects = pipewire_objects()
+            target = physical_fallback(objects)
+            if not target:
+                raise RuntimeError("No connected headphone or speaker output was found.")
+            state = read_route_state()
+            state["enabled"] = False
+            state.pop("app_routes", None)
+            ROUTE_STATE.parent.mkdir(parents=True, exist_ok=True)
+            ROUTE_STATE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            if not service_active(ROUTER_SERVICE):
+                set_service(ROUTER_SERVICE, True)
+            target_name = str(node_props(target).get("node.name", ""))
+            wait_for_audio_node(target_name)
+            result = run("pactl", "set-default-sink", target_name)
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or "Could not restore the hardware output.")
+            # The router is the sole application-link owner. Give it one
+            # reconciliation cycle before stopping the now-unused processors.
+            time.sleep(0.6)
+            if service_active(UPMIX_SERVICE):
+                set_service(UPMIX_SERVICE, False)
+            if service_active(HRIR_SERVICE):
+                set_service(HRIR_SERVICE, False)
+            self.refresh_status()
+        except Exception as exc:
+            self.fail("Could not stop audio processing", exc)
+
+    def apply_eq(self) -> None:
+        try:
+            gains = [slider.value() / 2.0 for slider in self.eq_sliders]
+            preamp = self.preamp.value()
+            write_eq_preset(preamp, gains, self.eq_enabled)
+            self.eq_preamp, self.eq_gains = preamp, gains
+            if service_active(HRIR_SERVICE):
+                self.restart_hrir_preserving_route()
+            self.refresh_status()
+        except Exception as exc:
+            self.fail("Could not apply EQ", exc)
+
+    def reset_eq(self) -> None:
+        self.preamp.setValue(-3.0)
+        for slider in self.eq_sliders:
+            slider.setValue(0)
+        self.eq_sliders[0].setValue(2)
+        self.eq_sliders[-1].setValue(2)
+        self.apply_eq()
+
+    def toggle_eq(self, enabled: bool) -> None:
+        if self._updating:
+            return
+        try:
+            self.eq_enabled = enabled
+            gains = [slider.value() / 2.0 for slider in self.eq_sliders]
+            self.eq_preamp, self.eq_gains = self.preamp.value(), gains
+            write_eq_preset(self.eq_preamp, self.eq_gains, self.eq_enabled)
+            if service_active(HRIR_SERVICE):
+                self.restart_hrir_preserving_route()
+        except Exception as exc:
+            self.fail("Could not change EQ service", exc)
+        self.refresh_status()
+
+    def disable_legacy(self) -> None:
+        existing = [path for path in LEGACY_FILES if path.exists()]
+        if not existing:
+            QMessageBox.information(self, "Legacy configuration", "The old global configuration is already disabled.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Disable old global configuration?",
+            "This will preserve the files with a .disabled-by-stereo-matrix-virtualizer suffix "
+            "and restart PipeWire. Playing audio will pause briefly.",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            for source in existing:
+                destination = source.with_name(source.name + ".disabled-by-stereo-matrix-virtualizer")
+                if destination.exists():
+                    destination.unlink()
+                shutil.move(source, destination)
+            result = run(
+                "systemctl",
+                "--user",
+                "restart",
+                "pipewire.service",
+                "pipewire-pulse.service",
+                "wireplumber.service",
+            )
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip())
+            QMessageBox.information(self, "Legacy configuration", "Old global upmix files were disabled and preserved.")
+        except Exception as exc:
+            self.fail("Could not disable old configuration", exc)
+        self.refresh_status()
+
+    def open_hrir_folder(self) -> None:
+        HRIR_DIR.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(HRIR_DIR)))
+
+    def refresh_status(self) -> None:
+        upmix_active = service_active(UPMIX_SERVICE)
+        hrir_active = service_active(HRIR_SERVICE)
+        route_state = read_route_state()
+        routed = service_active(ROUTER_SERVICE) and bool(route_state.get("enabled", False))
+        mode = normalized_mode(route_state.get("mode", "both"))
+        self._updating = True
+        self.processing_toggle.setChecked(routed)
+        selected_index = self.route_mode.findData(mode)
+        if selected_index >= 0:
+            self.route_mode.setCurrentIndex(selected_index)
+        self.eq_toggle.setChecked(self.eq_enabled)
+        self._updating = False
+
+        selected = read_selected_profile()
+        legacy = any(path.exists() for path in LEGACY_FILES)
+        try:
+            objects = pipewire_objects()
+            self.refresh_outputs(objects)
+            default = current_default_sink(objects)
+            default_name = node_props(default).get("node.name") if default else ""
+            labels = {
+                "both": "matrix → HRIR → physical output",
+                "matrix": "matrix → physical 7.1 output",
+                "hrir": "HRIR → physical stereo output",
+            }
+            route_label = labels[mode] if routed else "direct device passthrough"
+            expected_default = str(route_state.get("sink_name", ""))
+            if default_name and expected_default and default_name != expected_default:
+                route_label += " (physical default mismatch)"
+        except (RuntimeError, ValueError, TypeError, json.JSONDecodeError):
+            route_label = "unknown"
+        self.legacy_button.setEnabled(legacy)
+        self.status.setText(
+            f"Upmix node: {'ready' if pipewire_node_present(UPMIX_NODE) else 'off'}    |    "
+            f"HRIR node: {'ready' if pipewire_node_present(HRIR_NODE) else 'off'}\n"
+            f"Integrated EQ: {'enabled' if self.eq_enabled else 'bypassed'}    |    "
+            f"HRIR/EQ process: {'ready' if hrir_active else 'off'}\n"
+            f"Session routing: {route_label}    |    "
+            f"Physical output: {self.output_combo.currentText() or 'none'}\n"
+            f"Profile: {selected.name if selected else 'none'}    |    "
+            f"Legacy global upmix: {'active' if legacy else 'disabled'}"
+        )
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setApplicationName("Stereo Matrix Virtualizer")
+    runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+    instance_lock = QLockFile(str(runtime_dir / f"stereo-matrix-virtualizer-{os.getuid()}.lock"))
+    instance_lock.setStaleLockTime(0)
+    if not instance_lock.tryLock(100):
+        QMessageBox.information(
+            None,
+            "Stereo Matrix Virtualizer",
+            "Stereo Matrix Virtualizer is already open.",
+        )
+        return 0
+    window = UpmixWindow()
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

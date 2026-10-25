@@ -1,0 +1,179 @@
+#!/usr/bin/python3
+"""Build the native 7.1 HRIR -> stereo EQ PipeWire filter-chain config."""
+
+from __future__ import annotations
+
+import configparser
+import json
+import os
+from pathlib import Path
+
+
+HOME = Path.home()
+XDG_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share"))
+APP_CONFIG = HOME / ".config" / "stereo-matrix-virtualizer"
+EQ_STATE = APP_CONFIG / "eq.json"
+OUTPUT = APP_CONFIG / "eq-filter.conf"
+SETTINGS = APP_CONFIG / "settings.ini"
+LEGACY_VSM_CONFIG = (
+    HOME / ".var" / "app" / "de.berny23.virtual_surround_manager"
+    / "config" / "virtual-surround-manager"
+)
+HRIR_DIR = XDG_DATA_HOME / "stereo-matrix-virtualizer" / "hrir"
+LEGACY_HRIR_DIR = (
+    HOME / ".var" / "app" / "de.berny23.virtual_surround_manager"
+    / "data" / "virtual-surround-manager" / "hrir_wav"
+)
+HRIR_DIRS = (HRIR_DIR, LEGACY_HRIR_DIR)
+FREQUENCIES = (20, 31.5, 63, 125, 250, 500, 1000, 2000, 3000, 4000, 6000, 8000, 10000, 12000, 16000, 20000)
+
+
+def selected_hrir() -> Path:
+    parser = configparser.ConfigParser()
+    parser.read(SETTINGS if SETTINGS.exists() else LEGACY_VSM_CONFIG)
+    value = parser.get("Settings", "hrir_wav_file_path", fallback="")
+    profile = Path(value) if value else None
+    if not profile or not profile.is_file():
+        profile = next(
+            (candidate for directory in HRIR_DIRS for candidate in sorted(directory.glob("*.wav"))),
+            None,
+        )
+    if not profile:
+        searched = ", ".join(str(directory) for directory in HRIR_DIRS)
+        raise SystemExit(f"No HRIR WAV file found. Searched: {searched}")
+    return profile
+
+
+def eq_state() -> tuple[float, list[float], bool]:
+    defaults = [0.0] * len(FREQUENCIES)
+    defaults[0] = 1.0
+    defaults[-1] = 1.0
+    try:
+        data = json.loads(EQ_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        data = {}
+    gains = [float(value) for value in data.get("gains", defaults)]
+    if len(gains) != len(FREQUENCIES):
+        gains = defaults
+    return float(data.get("preamp", -3.0)), gains, bool(data.get("enabled", True))
+
+
+def item(text: str) -> str:
+    return "          " + text
+
+
+def main() -> int:
+    hrir = selected_hrir()
+    preamp, gains, enabled = eq_state()
+    filename = json.dumps(str(hrir))
+
+    nodes = [f'{{ type = builtin label = copy name = copy{channel} }}' for channel in ("FL", "FR", "FC", "LFE", "RL", "RR", "SL", "SR")]
+    convolution = (
+        ("FL_L", 0), ("FL_R", 1), ("SL_L", 2), ("SL_R", 3),
+        ("RL_L", 4), ("RL_R", 5), ("FC_L", 6), ("FR_R", 7),
+        ("FR_L", 8), ("SR_R", 9), ("SR_L", 10), ("RR_R", 11),
+        ("RR_L", 12), ("FC_R", 13), ("LFE_L", 6), ("LFE_R", 13),
+    )
+    nodes.extend(
+        f'{{ type = builtin label = convolver name = conv{name} config = {{ filename = {filename} channel = {channel} }} }}'
+        for name, channel in convolution
+    )
+    nodes.extend((
+        '{ type = builtin label = mixer name = mixL }',
+        '{ type = builtin label = mixer name = mixR }',
+    ))
+
+    links = []
+    for source, destinations in {
+        "FL": ("FL_L", "FL_R"), "FR": ("FR_L", "FR_R"),
+        "FC": ("FC_L", "FC_R"), "LFE": ("LFE_L", "LFE_R"),
+        "RL": ("RL_L", "RL_R"), "RR": ("RR_L", "RR_R"),
+        "SL": ("SL_L", "SL_R"), "SR": ("SR_L", "SR_R"),
+    }.items():
+        links.extend(f'{{ output = "copy{source}:Out" input = "conv{destination}:In" }}' for destination in destinations)
+    left = ("FL_L", "SL_L", "RL_L", "FC_L", "FR_L", "SR_L", "RR_L", "LFE_L")
+    right = ("FL_R", "SL_R", "RL_R", "FC_R", "FR_R", "SR_R", "RR_R", "LFE_R")
+    links.extend(f'{{ output = "conv{name}:Out" input = "mixL:In {index}" }}' for index, name in enumerate(left, 1))
+    links.extend(f'{{ output = "conv{name}:Out" input = "mixR:In {index}" }}' for index, name in enumerate(right, 1))
+
+    if enabled:
+        for channel, mixer in (("L", "mixL"), ("R", "mixR")):
+            nodes.append(
+                f'{{ type = ladspa name = pre_{channel} plugin = amp_1181 label = amp '
+                f'control = {{ "Amps gain (dB)" = {preamp:.1f} }} }}'
+            )
+            links.append(f'{{ output = "{mixer}:Out" input = "pre_{channel}:Input" }}')
+            previous = f"pre_{channel}"
+            output_port = "Output"
+            for index, (frequency, gain) in enumerate(zip(FREQUENCIES, gains, strict=True)):
+                current = f"eq_{channel}_{index}"
+                nodes.append(
+                    f'{{ type = builtin name = {current} label = bq_peaking '
+                    f'control = {{ "Freq" = {float(frequency):.1f} "Q" = 1.4 "Gain" = {gain:.1f} }} }}'
+                )
+                links.append(f'{{ output = "{previous}:{output_port}" input = "{current}:In" }}')
+                previous, output_port = current, "Out"
+            limiter_input = "Input 1" if channel == "L" else "Input 2"
+            links.append(f'{{ output = "{previous}:Out" input = "limiter:{limiter_input}" }}')
+        nodes.append(
+            '{ type = ladspa name = limiter plugin = fast_lookahead_limiter_1913 '
+            'label = fastLookaheadLimiter control = { "Input gain (dB)" = 0.0 '
+            '"Limit (dB)" = -1.0 "Release time (s)" = 0.05 } }'
+        )
+        outputs = '[ "limiter:Output 1" "limiter:Output 2" ]'
+    else:
+        outputs = '[ "mixL:Out" "mixR:Out" ]'
+
+    config = f'''context.properties = {{ log.level = 0 }}
+context.spa-libs = {{
+  audio.convert.* = audioconvert/libspa-audioconvert
+  support.* = support/libspa-support
+}}
+context.modules = [
+  {{ name = libpipewire-module-rt flags = [ ifexists nofail ] }}
+  {{ name = libpipewire-module-protocol-native }}
+  {{ name = libpipewire-module-client-node }}
+  {{ name = libpipewire-module-adapter }}
+  {{ name = libpipewire-module-filter-chain
+    args = {{
+      node.description = "Native 7.1 HRIR + EQ"
+      media.name = "Native 7.1 HRIR + EQ"
+      filter.graph = {{
+        nodes = [
+{os.linesep.join(item(node) for node in nodes)}
+        ]
+        links = [
+{os.linesep.join(item(link) for link in links)}
+        ]
+        inputs = [ "copyFL:In" "copyFR:In" "copyFC:In" "copyLFE:In" "copyRL:In" "copyRR:In" "copySL:In" "copySR:In" ]
+        outputs = {outputs}
+      }}
+      capture.props = {{
+        node.name = "effect_input.virtual-surround-manager"
+        node.description = "Native 7.1 HRIR + EQ"
+        media.class = Audio/Sink
+        audio.channels = 8
+        audio.position = [ FL FR FC LFE RL RR SL SR ]
+      }}
+      playback.props = {{
+        node.name = "effect_output.virtual-surround-manager"
+        node.description = "Native HRIR Stereo Output"
+        node.passive = true
+        node.autoconnect = false
+        node.dont-reconnect = true
+        audio.channels = 2
+        audio.position = [ FL FR ]
+      }}
+    }}
+  }}
+]
+'''
+    APP_CONFIG.mkdir(parents=True, exist_ok=True)
+    temporary = OUTPUT.with_suffix(".tmp")
+    temporary.write_text(config, encoding="utf-8")
+    os.replace(temporary, OUTPUT)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

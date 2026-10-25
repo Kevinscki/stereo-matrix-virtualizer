@@ -1,0 +1,14 @@
+[Unit]
+Description=Native PipeWire 7.1 HRIR and EQ service
+After=pipewire.service wireplumber.service
+BindsTo=pipewire.service
+
+[Service]
+Type=simple
+ExecStartPre=%h/.local/libexec/stereo-upmix-build-filter
+ExecStart=/usr/bin/pipewire -c %h/.config/stereo-matrix-virtualizer/eq-filter.conf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

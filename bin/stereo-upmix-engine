@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly INPUT_NODE="effect_input.stereo-matrix-upmix"
+readonly OUTPUT_NODE="effect_output.stereo-matrix-upmix"
+
+if ! command -v pw-loopback >/dev/null 2>&1; then
+    echo "stereo-upmix-engine: pw-loopback is required" >&2
+    exit 127
+fi
+
+# PipeWire's PSD matrix extracts the uncorrelated L-R ambience for the
+# surround channels. Center and LFE are derived from L+R. The router sends the
+# resulting 7.1 stream either to a real surround output or to the HRIR stage.
+exec pw-loopback \
+    --name=stereo-matrix-upmix \
+    --capture-props="{
+        node.name = \"${INPUT_NODE}\"
+        node.description = \"Stereo Matrix Upmix to 7.1\"
+        media.class = \"Audio/Sink\"
+        audio.position = [ FL FR ]
+    }" \
+    --playback-props="{
+        node.name = \"${OUTPUT_NODE}\"
+        node.description = \"Stereo Matrix Upmix 7.1 Output\"
+        node.passive = true
+        node.autoconnect = false
+        node.dont-reconnect = true
+        audio.channels = 8
+        audio.position = [ FL FR FC LFE RL RR SL SR ]
+        channelmix.upmix = true
+        channelmix.upmix-method = psd
+        channelmix.normalize = true
+        channelmix.lfe-cutoff = 120
+        channelmix.fc-cutoff = 12000
+        channelmix.rear-delay = 12.0
+        channelmix.hilbert-taps = 63
+        channelmix.stereo-widen = 0.0
+    }"

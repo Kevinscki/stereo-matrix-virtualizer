@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Stereo Matrix Virtualizer
+Comment=Matrix-upmix stereo and render surround through an HRIR
+Exec=stereo-upmix-manager
+TryExec=stereo-upmix-manager
+Icon=audio-headphones
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=PipeWire;surround;upmix;7.1;HRIR;
