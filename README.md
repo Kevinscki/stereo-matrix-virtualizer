@@ -18,13 +18,13 @@ path without presenting a virtual processor as hardware.
 Modes are selected manually. Automatic channel detection is intentionally
 avoided because applications frequently advertise misleading layouts.
 
-n## Screenshots
+## Screenshots
 
 ![Main Interface](screenshots/main_ui.png)
 
 ## Requirements
 
-- Linux with PipeWire and WirePlumber
+- Linux with PipeWire and WirePlumberrePlumber
 - `pw-loopback`, `pw-dump`, `pw-link`, `pw-cli`, `pw-metadata`, `wpctl` and `pactl`
 - Python 3 and PySide6 QtWidgets
 - SWH LADSPA plugins (`amp_1181` and `fast_lookahead_limiter_1913`)
