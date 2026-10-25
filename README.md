@@ -18,6 +18,10 @@ path without presenting a virtual processor as hardware.
 Modes are selected manually. Automatic channel detection is intentionally
 avoided because applications frequently advertise misleading layouts.
 
+n## Screenshots
+
+![Main Interface](screenshots/main_ui.png)
+
 ## Requirements
 
 - Linux with PipeWire and WirePlumber
@@ -89,6 +93,7 @@ The release archive has normalized ownership, timestamps and ordering, so the
 same source tree and version produce the same checksum.
 
 ## Implementation notes
+- Developed and tested on Wayland.
 
 - Matrix upmixing uses PipeWire's `channelmix.upmix-method = psd`.
 - HRIR convolution and EQ run in a native PipeWire filter-chain.
