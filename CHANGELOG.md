@@ -16,6 +16,8 @@
   dropdowns and spin boxes instead of changing their values.
 - Gather periodic status off the GUI thread and dump PipeWire once per
   refresh, removing a ~0.4 s freeze every 2.5 s.
+- Document per-mode requirements, Debian 13 packages and Debian 12 limits;
+  add a References section. `install.sh --check` also reports optional engines.
 - Keep all passive Matrix, HRIR and combined paths unchanged and independently usable.
 - Keep the GPL active helper isolated from the MIT-licensed controller.
 

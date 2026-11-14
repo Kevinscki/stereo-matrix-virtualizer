@@ -14,8 +14,14 @@ if ((${#missing[@]})); then
     printf 'Install PipeWire tools, WirePlumber and PulseAudio utilities, then retry.\n' >&2
     exit 1
 fi
-if ! python3 -c 'import PySide6.QtWidgets' >/dev/null 2>&1; then
-    printf 'Missing Python Qt binding: PySide6.QtWidgets\n' >&2
+if ! /usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' >/dev/null 2>&1; then
+    printf 'Python 3.10 or newer is required at /usr/bin/python3.\n' >&2
+    exit 1
+fi
+if ! /usr/bin/python3 -c 'import PySide6.QtWidgets' >/dev/null 2>&1; then
+    printf 'Missing Python Qt binding: PySide6.QtWidgets (for /usr/bin/python3)\n' >&2
+    printf 'Debian 13+: sudo apt install python3-pyside6.qtwidgets\n' >&2
+    printf 'Debian 12 does not package PySide6; see README.md (Requirements).\n' >&2
     exit 1
 fi
 find_ladspa_plugin() {
@@ -32,6 +38,20 @@ if ! find_ladspa_plugin amp_1181.so || ! find_ladspa_plugin fast_lookahead_limit
 fi
 if [[ "${1:-}" == "--check" ]]; then
     printf 'All required commands, Python modules and LADSPA plugins were found.\n'
+    optional() {
+        local label=$1
+        shift
+        local command
+        for command in "$@"; do
+            if ! command -v "$command" >/dev/null 2>&1; then
+                printf 'Optional %s: unavailable (missing %s)\n' "$label" "$command"
+                return
+            fi
+        done
+        printf 'Optional %s: available\n' "$label"
+    }
+    optional 'FreeSurround active decoder build' pw-record pw-play cc c++ git
+    optional 'FFmpeg surround engine' ffmpeg pw-record pw-play
     exit 0
 elif (($#)); then
     printf 'Usage: %s [--check]\n' "$0" >&2
