@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly RETROSURROUND_REPOSITORY="https://github.com/codanric/RetroSurround.git"
+readonly RETROSURROUND_COMMIT="4a25352be3b22d6a6e89a1b034a1698ecfff82c9"
+readonly SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+source_dir=""
+output="${HOME}/.local/libexec/stereo-active-decoder"
+while (($#)); do
+    case "$1" in
+        --source)
+            source_dir=${2:?--source requires a RetroSurround checkout}
+            shift 2
+            ;;
+        --output)
+            output=${2:?--output requires a path}
+            shift 2
+            ;;
+        *)
+            printf 'Usage: %s [--source DIR] [--output FILE]\n' "$0" >&2
+            exit 2
+            ;;
+    esac
+done
+
+for command in cc c++ git; do
+    command -v "$command" >/dev/null 2>&1 || {
+        printf 'Active decoder build requires %s.\n' "$command" >&2
+        exit 127
+    }
+done
+
+build_dir=$(mktemp -d)
+cleanup() {
+    rm -rf -- "$build_dir"
+}
+trap cleanup EXIT
+
+if [[ -z "$source_dir" ]]; then
+    source_dir="$build_dir/RetroSurround"
+    git init -q "$source_dir"
+    git -C "$source_dir" remote add origin "$RETROSURROUND_REPOSITORY"
+    git -C "$source_dir" fetch -q --depth 1 origin "$RETROSURROUND_COMMIT"
+    git -C "$source_dir" checkout -q --detach FETCH_HEAD
+fi
+
+for file in \
+    Source/freesurround_adapter.h Source/freesurround_decoder.cpp \
+    Source/freesurround_decoder.h Source/windows_channel_order.h \
+    Source/biquad.h Source/channelmaps.cpp Source/channelmaps.h \
+    Source/kiss_fft.c Source/kiss_fft.h Source/kiss_fftr.c Source/kiss_fftr.h \
+    Source/_kiss_fft_guts.h Source/kiss_fft_log.h; do
+    [[ -f "$source_dir/$file" ]] || {
+        printf 'RetroSurround source is missing %s\n' "$file" >&2
+        exit 1
+    }
+done
+
+cc -O3 -fPIC -Dkiss_fft_scalar=double -I"$source_dir/Source" \
+    -c "$source_dir/Source/kiss_fft.c" -o "$build_dir/kiss_fft.o"
+cc -O3 -fPIC -Dkiss_fft_scalar=double -I"$source_dir/Source" \
+    -c "$source_dir/Source/kiss_fftr.c" -o "$build_dir/kiss_fftr.o"
+c++ -O3 -std=c++17 -Dkiss_fft_scalar=double -I"$source_dir/Source" \
+    "$SCRIPT_DIR/stereo-active-decoder.cpp" \
+    "$source_dir/Source/freesurround_decoder.cpp" \
+    "$source_dir/Source/channelmaps.cpp" \
+    "$build_dir/kiss_fft.o" "$build_dir/kiss_fftr.o" \
+    -o "$build_dir/stereo-active-decoder"
+
+install -Dm755 "$build_dir/stereo-active-decoder" "$output"
+printf 'Built FreeSurround active decoder: %s\n' "$output"

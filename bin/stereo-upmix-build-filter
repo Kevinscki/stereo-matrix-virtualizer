@@ -11,7 +11,7 @@ from pathlib import Path
 
 HOME = Path.home()
 XDG_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share"))
-APP_CONFIG = HOME / ".config" / "stereo-matrix-virtualizer"
+APP_CONFIG = HOME / ".config" / "stereo-upmix-manager"
 EQ_STATE = APP_CONFIG / "eq.json"
 OUTPUT = APP_CONFIG / "eq-filter.conf"
 SETTINGS = APP_CONFIG / "settings.ini"
@@ -20,11 +20,6 @@ LEGACY_VSM_CONFIG = (
     / "config" / "virtual-surround-manager"
 )
 HRIR_DIR = XDG_DATA_HOME / "stereo-matrix-virtualizer" / "hrir"
-LEGACY_HRIR_DIR = (
-    HOME / ".var" / "app" / "de.berny23.virtual_surround_manager"
-    / "data" / "virtual-surround-manager" / "hrir_wav"
-)
-HRIR_DIRS = (HRIR_DIR, LEGACY_HRIR_DIR)
 FREQUENCIES = (20, 31.5, 63, 125, 250, 500, 1000, 2000, 3000, 4000, 6000, 8000, 10000, 12000, 16000, 20000)
 
 
@@ -33,14 +28,15 @@ def selected_hrir() -> Path:
     parser.read(SETTINGS if SETTINGS.exists() else LEGACY_VSM_CONFIG)
     value = parser.get("Settings", "hrir_wav_file_path", fallback="")
     profile = Path(value) if value else None
+    # Only profiles inside HRIR_DIR are used. A selection saved from another
+    # location (e.g. the old Virtual Surround Manager folder) falls back to
+    # the file of the same name in HRIR_DIR, then to the first available one.
+    if profile and profile.resolve().parent != HRIR_DIR.resolve():
+        profile = HRIR_DIR / profile.name
     if not profile or not profile.is_file():
-        profile = next(
-            (candidate for directory in HRIR_DIRS for candidate in sorted(directory.glob("*.wav"))),
-            None,
-        )
+        profile = next(iter(sorted(HRIR_DIR.glob("*.wav"))), None)
     if not profile:
-        searched = ", ".join(str(directory) for directory in HRIR_DIRS)
-        raise SystemExit(f"No HRIR WAV file found. Searched: {searched}")
+        raise SystemExit(f"No HRIR WAV file found in {HRIR_DIR}")
     return profile
 
 

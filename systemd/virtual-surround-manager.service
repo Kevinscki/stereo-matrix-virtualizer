@@ -6,7 +6,7 @@ BindsTo=pipewire.service
 [Service]
 Type=simple
 ExecStartPre=%h/.local/libexec/stereo-upmix-build-filter
-ExecStart=/usr/bin/pipewire -c %h/.config/stereo-matrix-virtualizer/eq-filter.conf
+ExecStart=/usr/bin/pipewire -c %h/.config/stereo-upmix-manager/eq-filter.conf
 Restart=on-failure
 RestartSec=2
 

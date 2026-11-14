@@ -10,12 +10,15 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile, QTimer, Qt, QUrl
+from PySide6.QtCore import QCoreApplication, QEvent, QLockFile, QObject, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
+    QAbstractSlider,
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -27,7 +30,10 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
+    QSpinBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -35,10 +41,42 @@ from PySide6.QtWidgets import (
 
 APP_ID = "de.berny23.virtual_surround_manager"
 UPMIX_SERVICE = "stereo-upmix-manager.service"
+ACTIVE_SERVICE = "stereo-active-decoder.service"
+FFMPEG_SERVICE = "stereo-ffmpeg-upmix.service"
 HRIR_SERVICE = "virtual-surround-manager.service"
 ROUTER_SERVICE = "stereo-upmix-router.service"
 UPMIX_NODE = "effect_input.stereo-matrix-upmix"
+ACTIVE_NODE = "effect_input.stereo-active-upmix"
+FFMPEG_NODE = "effect_input.stereo-ffmpeg-upmix"
 HRIR_NODE = "effect_input.virtual-surround-manager"
+
+# Routing mode -> upmixer sink applications are sent to (None: HRIR directly).
+MODE_UPMIXER = {
+    "both": UPMIX_NODE,
+    "matrix": UPMIX_NODE,
+    "active_hrir": ACTIVE_NODE,
+    "active": ACTIVE_NODE,
+    "ffmpeg_hrir": FFMPEG_NODE,
+    "ffmpeg": FFMPEG_NODE,
+    "hrir": None,
+}
+UPMIXER_ONLY_MODES = {"matrix", "active", "ffmpeg"}
+
+FFMPEG_MODES = {"ffmpeg", "ffmpeg_hrir"}
+# Starting points for the FFmpeg surround filter; tune by ear.
+FFMPEG_DEFAULTS = {
+    "focus": 0.0, "angle": 90.0, "smooth": 0.0,
+    "center": 1.0, "surround": 1.0,
+    "lfe": True, "lfe_level": 1.0, "lfe_low": 128, "lfe_high": 256,
+    "win_size": 2048,
+}
+FFMPEG_PRESETS = {
+    "Neutral": {},
+    "Matrix (PL2 / Neo)": {"focus": 0.3, "smooth": 0.2},
+    "Movies": {"focus": 0.2, "smooth": 0.1, "center": 1.3, "lfe_level": 1.2},
+    "Music (wide)": {"angle": 120.0, "focus": -0.2, "smooth": 0.4, "center": 0.8, "surround": 0.9},
+}
+FFMPEG_WINDOWS = (1024, 2048, 4096, 8192)
 
 EQ_PRESET_NAME = "Stereo Upmix 16-band EQ"
 EQ_FREQUENCIES = (20, 31.5, 63, 125, 250, 500, 1000, 2000, 3000, 4000, 6000, 8000, 10000, 12000, 16000, 20000)
@@ -46,17 +84,22 @@ EQ_FREQUENCIES = (20, 31.5, 63, 125, 250, 500, 1000, 2000, 3000, 4000, 6000, 800
 HOME = Path.home()
 XDG_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share"))
 VSM_ROOT = HOME / ".var" / "app" / APP_ID
-APP_CONFIG = HOME / ".config" / "stereo-matrix-virtualizer"
+# Preserve the configuration directory used by the original stable release.
+# The public project name changed, but moving live route/EQ state would make an
+# upgrade appear reset and could briefly route applications to the wrong sink.
+APP_CONFIG = HOME / ".config" / "stereo-upmix-manager"
 APP_DATA = XDG_DATA_HOME / "stereo-matrix-virtualizer"
 HRIR_DIR = APP_DATA / "hrir"
-LEGACY_HRIR_DIR = VSM_ROOT / "data" / "virtual-surround-manager" / "hrir_wav"
-HRIR_DIRS = (HRIR_DIR, LEGACY_HRIR_DIR)
 SETTINGS = APP_CONFIG / "settings.ini"
 LEGACY_VSM_CONFIG = VSM_ROOT / "config" / "virtual-surround-manager"
 EQ_STATE = APP_CONFIG / "eq.json"
 EQ_PIPEWIRE_CONFIG = APP_CONFIG / "eq-filter.conf"
 FILTER_BUILDER = HOME / ".local" / "libexec" / "stereo-upmix-build-filter"
+ACTIVE_DECODER = HOME / ".local" / "libexec" / "stereo-active-decoder"
 ROUTE_STATE = APP_CONFIG / "route.json"
+FFMPEG_SETTINGS = APP_CONFIG / "ffmpeg-surround.json"
+FFMPEG_ENV = APP_CONFIG / "ffmpeg-surround.env"
+UI_STATE = APP_CONFIG / "ui.json"
 EQ_PRESET_DIRS = (
     HOME / ".config" / "easyeffects" / "output",
     HOME / ".var" / "app" / "com.github.wwmm.easyeffects" / "data" / "easyeffects" / "output",
@@ -87,11 +130,6 @@ def set_service(name: str, enabled: bool) -> None:
     result = run("systemctl", "--user", action, state, name)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or f"Could not change {name}")
-
-
-def pipewire_node_present(name: str) -> bool:
-    dump = run("pw-dump")
-    return dump.returncode == 0 and f'"{name}"' in dump.stdout
 
 
 def pipewire_objects() -> list[dict]:
@@ -167,7 +205,7 @@ def route_streams(
         # Passive virtual sinks do not always trigger WirePlumber to recreate
         # an application link after target metadata changes. Link matching
         # channel ports explicitly for the managed matrix/VSM sinks.
-        if stream_target_name == UPMIX_NODE or (
+        if stream_target_name in {UPMIX_NODE, ACTIVE_NODE, FFMPEG_NODE} or (
             stream_target_name == HRIR_NODE and channel_count > 2
         ):
             output_ports = [
@@ -255,7 +293,125 @@ def read_route_state() -> dict:
 
 def normalized_mode(value: object) -> str:
     mode = {"stereo": "both", "native": "hrir"}.get(str(value), str(value))
-    return mode if mode in {"matrix", "hrir", "both"} else "both"
+    return mode if mode in MODE_UPMIXER else "both"
+
+
+def read_ffmpeg_settings() -> dict:
+    settings = dict(FFMPEG_DEFAULTS)
+    try:
+        value = json.loads(FFMPEG_SETTINGS.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            settings.update({key: value[key] for key in FFMPEG_DEFAULTS if key in value})
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return settings
+
+
+def write_ffmpeg_settings(settings: dict) -> None:
+    FFMPEG_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    temporary = FFMPEG_SETTINGS.with_suffix(".tmp")
+    temporary.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, FFMPEG_SETTINGS)
+
+
+def ffmpeg_env_override() -> bool:
+    try:
+        return any(
+            line.strip().startswith("STEREO_FFMPEG_SURROUND=") and line.split("=", 1)[1].strip()
+            for line in FFMPEG_ENV.read_text(encoding="utf-8").splitlines()
+        )
+    except OSError:
+        return False
+
+
+def read_ui_state() -> dict:
+    try:
+        value = json.loads(UI_STATE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+
+def write_ui_state(**changes: object) -> None:
+    state = read_ui_state()
+    state.update(changes)
+    try:
+        UI_STATE.parent.mkdir(parents=True, exist_ok=True)
+        UI_STATE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass  # purely cosmetic state
+
+
+ROUTE_LABELS = {
+    "both": "passive matrix → HRIR → physical output",
+    "matrix": "passive matrix → physical 7.1 output",
+    "active_hrir": "active FreeSurround → HRIR → physical output",
+    "active": "active FreeSurround → physical 7.1 output",
+    "ffmpeg_hrir": "active FFmpeg surround → HRIR → physical output",
+    "ffmpeg": "active FFmpeg surround → physical 7.1 output",
+    "hrir": "HRIR → physical stereo output",
+}
+
+
+def collect_status() -> dict:
+    """Gather everything the status display needs.
+
+    Runs subprocesses only (no Qt), so it is safe on a worker thread.
+    PipeWire is dumped once and reused for every lookup.
+    """
+    route_state = read_route_state()
+    mode = normalized_mode(route_state.get("mode", "both"))
+    routed = service_active(ROUTER_SERVICE) and bool(route_state.get("enabled", False))
+    status = {
+        "route_state": route_state,
+        "mode": mode,
+        "routed": routed,
+        "active_decoder": service_active(ACTIVE_SERVICE),
+        "hrir": service_active(HRIR_SERVICE),
+        "selected": read_selected_profile(),
+        "legacy": any(path.exists() for path in LEGACY_FILES),
+        "outputs": None,
+        "nodes": set(),
+    }
+    try:
+        objects = pipewire_objects()
+        status["outputs"] = physical_outputs(objects)
+        status["nodes"] = {str(node_props(node).get("node.name", "")) for node in audio_nodes(objects)}
+        default = current_default_sink(objects)
+        default_name = node_props(default).get("node.name") if default else ""
+        route_label = ROUTE_LABELS[mode] if routed else "direct device passthrough"
+        expected_default = str(route_state.get("sink_name", ""))
+        if default_name and expected_default and default_name != expected_default:
+            route_label += " (physical default mismatch)"
+    except (RuntimeError, ValueError, TypeError, json.JSONDecodeError):
+        route_label = "unknown"
+    status["route_label"] = route_label
+    return status
+
+
+class StatusRelay(QObject):
+    """Carries a worker thread's status snapshot back to the GUI thread."""
+
+    ready = Signal(int, object)
+
+
+class WheelToScroll(QObject):
+    """Send wheel events over unfocused value controls to the page scrollbar.
+
+    Without this, a slider, dropdown or spin box under the pointer swallows
+    the wheel while scrolling the page and silently changes its value. A
+    control still takes the wheel once clicked (focused).
+    """
+
+    def __init__(self, scroll: QScrollArea) -> None:
+        super().__init__(scroll)
+        self.scroll = scroll
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Wheel and not watched.hasFocus():
+            QCoreApplication.sendEvent(self.scroll.verticalScrollBar(), event)
+            return True
+        return False
 
 
 def volume_state(node: dict | None) -> tuple[float, bool]:
@@ -278,19 +434,25 @@ def read_selected_profile() -> Path | None:
     try:
         parser.read(SETTINGS if SETTINGS.exists() else LEGACY_VSM_CONFIG)
         value = parser.get("Settings", "hrir_wav_file_path", fallback="")
-        return Path(value) if value else None
     except (OSError, configparser.Error):
         return None
+    if not value:
+        return None
+    # Mirror stereo-upmix-build-filter: profiles outside HRIR_DIR are never
+    # used, so show the same-named file in HRIR_DIR (if any) instead.
+    profile = Path(value)
+    if profile.resolve().parent != HRIR_DIR.resolve():
+        profile = HRIR_DIR / profile.name
+    return profile if profile.is_file() else None
 
 
 def write_selected_profile(profile: Path, auto_enabled: bool | None = None) -> None:
-    allowed_directories = {directory.resolve() for directory in HRIR_DIRS if directory.exists()}
     if (
         profile.suffix.lower() != ".wav"
         or not profile.is_file()
-        or profile.resolve().parent not in allowed_directories
+        or profile.resolve().parent != HRIR_DIR.resolve()
     ):
-        raise ValueError("The selected HRIR is not a WAV file in a configured profile directory.")
+        raise ValueError(f"The selected HRIR is not a WAV file in {HRIR_DIR}.")
 
     parser = configparser.ConfigParser()
     parser.optionxform = str
@@ -317,7 +479,7 @@ def write_selected_profile(profile: Path, auto_enabled: bool | None = None) -> N
 
 def hrir_profiles() -> list[Path]:
     return sorted(
-        {profile.resolve() for directory in HRIR_DIRS for profile in directory.glob("*.wav")},
+        {profile.resolve() for profile in HRIR_DIR.glob("*.wav")},
         key=lambda item: item.name.casefold(),
     )
 
@@ -410,12 +572,19 @@ class UpmixWindow(QMainWindow):
             write_eq_preset(self.eq_preamp, self.eq_gains, self.eq_enabled)
         self.setWindowTitle("Stereo Matrix Virtualizer")
         self.setMinimumWidth(880)
+        self.setMinimumHeight(360)
         self._build_ui()
+        self.fit_to_screen()
         self.load_profiles()
         self.refresh_status()
 
+        # Periodic refreshes gather status on a worker thread: pw-dump and
+        # systemctl take a few hundred ms and would otherwise freeze
+        # scrolling and input each time.
+        self._status_relay = StatusRelay(self)
+        self._status_relay.ready.connect(self._apply_async_status)
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.refresh_status)
+        self.timer.timeout.connect(self.refresh_status_async)
         self.timer.start(2500)
 
     def _build_ui(self) -> None:
@@ -424,7 +593,7 @@ class UpmixWindow(QMainWindow):
         layout.setContentsMargins(24, 22, 24, 22)
         layout.setSpacing(14)
 
-        title = QLabel("Stereo Matrix Upmix + HRIR")
+        title = QLabel("Stereo Matrix Virtualizer")
         title_font = QFont()
         title_font.setPointSize(17)
         title_font.setBold(True)
@@ -432,8 +601,8 @@ class UpmixWindow(QMainWindow):
         layout.addWidget(title)
 
         subtitle = QLabel(
-            "Choose one global PipeWire path for every application: matrix, HRIR, "
-            "both stages, or direct device passthrough."
+            "Choose one global PipeWire path: passive matrix, FreeSurround or FFmpeg "
+            "active upmixing, HRIR headphone rendering, or direct device passthrough."
         )
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
@@ -460,8 +629,12 @@ class UpmixWindow(QMainWindow):
         route_row = QHBoxLayout()
         route_row.addWidget(QLabel("Routing mode"))
         self.route_mode = QComboBox()
-        self.route_mode.addItem("Matrix upscaler → HRIR virtualizer", "both")
-        self.route_mode.addItem("Matrix upscaler only (7.1 output)", "matrix")
+        self.route_mode.addItem("Passive matrix → HRIR virtualizer", "both")
+        self.route_mode.addItem("Passive matrix only (7.1 output)", "matrix")
+        self.route_mode.addItem("Active FreeSurround → HRIR virtualizer", "active_hrir")
+        self.route_mode.addItem("Active FreeSurround only (7.1 output)", "active")
+        self.route_mode.addItem("Active FFmpeg surround → HRIR virtualizer", "ffmpeg_hrir")
+        self.route_mode.addItem("Active FFmpeg surround only (7.1 output)", "ffmpeg")
         self.route_mode.addItem("HRIR virtualizer only", "hrir")
         selected_mode = normalized_mode(self.route_state.get("mode", "both"))
         selected_index = self.route_mode.findData(selected_mode)
@@ -470,6 +643,10 @@ class UpmixWindow(QMainWindow):
         route_row.addWidget(self.route_mode)
         route_row.addStretch()
         layout.addLayout(route_row)
+
+        self._build_ffmpeg_group(layout)
+        self.route_mode.currentIndexChanged.connect(self.update_ffmpeg_visibility)
+        self.update_ffmpeg_visibility()
 
         profile_label = QLabel("HRIR profile")
         profile_label.setStyleSheet("font-weight: 600")
@@ -564,13 +741,181 @@ class UpmixWindow(QMainWindow):
 
         routing = QLabel(
             "The selected mode applies globally; channel detection is intentionally "
-            "not used because applications can report misleading layouts. Matrix-only "
-            "is intended for a real 7.1 HDMI or S/PDIF endpoint."
+            "not used because applications can report misleading layouts. Upmixer-only "
+            "modes require a real 7.1 output; headphone use needs an HRIR mode."
         )
         routing.setWordWrap(True)
         layout.addWidget(routing)
 
-        self.setCentralWidget(central)
+        # The content lives in a scroll area so the window can be resized
+        # freely; scrollbars only appear when expanded content (e.g. the
+        # FFmpeg panel) no longer fits, instead of the window growing.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(central)
+        self.setCentralWidget(scroll)
+        self._wheel_guard = WheelToScroll(scroll)
+        for control in central.findChildren(QWidget):
+            if isinstance(control, (QAbstractSlider, QAbstractSpinBox, QComboBox)):
+                control.setFocusPolicy(Qt.StrongFocus)  # the wheel no longer grabs focus
+                control.installEventFilter(self._wheel_guard)
+        self._content = central
+
+    def fit_to_screen(self) -> None:
+        """Open at the content's natural height, capped to the screen."""
+        available = self.screen().availableGeometry()
+        hint = self._content.sizeHint()
+        width = min(max(hint.width() + 24, self.minimumWidth()), available.width())
+        height = min(hint.height() + 8, int(available.height() * 0.9))
+        self.resize(width, height)
+
+    def _build_ffmpeg_group(self, layout: QVBoxLayout) -> None:
+        # Container shown only in FFmpeg modes: a collapse header plus body.
+        self.ffmpeg_group = QWidget()
+        container = QVBoxLayout(self.ffmpeg_group)
+        container.setContentsMargins(0, 0, 0, 0)
+        container.setSpacing(4)
+        self.ffmpeg_toggle = QToolButton()
+        self.ffmpeg_toggle.setText("FFmpeg surround settings")
+        self.ffmpeg_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.ffmpeg_toggle.setAutoRaise(True)
+        self.ffmpeg_toggle.setCheckable(True)
+        self.ffmpeg_toggle.setStyleSheet("font-weight: 600")
+        container.addWidget(self.ffmpeg_toggle)
+        self.ffmpeg_body = QGroupBox()
+        container.addWidget(self.ffmpeg_body)
+        group_layout = QVBoxLayout(self.ffmpeg_body)
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Presets"))
+        for name, values in FFMPEG_PRESETS.items():
+            button = QPushButton(name)
+            button.clicked.connect(lambda _checked=False, v=values: self.apply_ffmpeg_preset(v))
+            preset_row.addWidget(button)
+        preset_row.addStretch()
+        group_layout.addLayout(preset_row)
+
+        # key -> (label, minimum, maximum, scale, value format, tooltip)
+        specs = {
+            "focus": ("Focus", -100, 100, 100, "{:+.2f}",
+                      "Negative: diffuse, enveloping. Positive: sharper, pinpoint steering."),
+            "angle": ("Angle", 0, 360, 1, "{:.0f}°",
+                      "Width of the front soundstage (90° is neutral)."),
+            "smooth": ("Smoothness", 0, 100, 100, "{:.2f}",
+                       "Temporal smoothing; reduces pumping when sounds move between speakers."),
+            "center": ("Centre level", 0, 300, 100, "×{:.2f}", "Dialogue/centre channel output level."),
+            "surround": ("Surround level", 0, 300, 100, "×{:.2f}", "Side and rear channel output level."),
+            "lfe_level": ("LFE level", 0, 300, 100, "×{:.2f}", "Subwoofer channel output level."),
+        }
+        self.ffmpeg_sliders: dict[str, tuple[QSlider, int]] = {}
+        for key, (text, minimum, maximum, scale, fmt, tip) in specs.items():
+            row = QHBoxLayout()
+            name = QLabel(text)
+            name.setMinimumWidth(110)
+            name.setToolTip(tip)
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(minimum, maximum)
+            slider.setToolTip(tip)
+            value = QLabel()
+            value.setMinimumWidth(56)
+            value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            slider.valueChanged.connect(
+                lambda raw, label=value, f=fmt, sc=scale: label.setText(f.format(raw / sc))
+            )
+            row.addWidget(name)
+            row.addWidget(slider, 1)
+            row.addWidget(value)
+            group_layout.addLayout(row)
+            self.ffmpeg_sliders[key] = (slider, scale)
+
+        lfe_row = QHBoxLayout()
+        self.ffmpeg_lfe = QCheckBox("LFE channel")
+        lfe_row.addWidget(self.ffmpeg_lfe)
+        lfe_row.addWidget(QLabel("Crossover"))
+        self.ffmpeg_lfe_low = QSpinBox()
+        self.ffmpeg_lfe_low.setRange(0, 256)
+        self.ffmpeg_lfe_low.setSuffix(" Hz")
+        lfe_row.addWidget(self.ffmpeg_lfe_low)
+        lfe_row.addWidget(QLabel("to"))
+        self.ffmpeg_lfe_high = QSpinBox()
+        self.ffmpeg_lfe_high.setRange(1, 512)
+        self.ffmpeg_lfe_high.setSuffix(" Hz")
+        lfe_row.addWidget(self.ffmpeg_lfe_high)
+        lfe_row.addSpacing(20)
+        lfe_row.addWidget(QLabel("Quality / latency"))
+        self.ffmpeg_window = QComboBox()
+        for size in FFMPEG_WINDOWS:
+            self.ffmpeg_window.addItem(f"{size} samples (~{size * 1000 / 48000:.0f} ms)", size)
+        lfe_row.addWidget(self.ffmpeg_window)
+        lfe_row.addStretch()
+        group_layout.addLayout(lfe_row)
+
+        actions = QHBoxLayout()
+        apply_button = QPushButton("Apply")
+        apply_button.clicked.connect(self.apply_ffmpeg_settings)
+        actions.addWidget(apply_button)
+        reset_button = QPushButton("Reset")
+        reset_button.clicked.connect(lambda: self.apply_ffmpeg_preset({}))
+        actions.addWidget(reset_button)
+        actions.addStretch()
+        self.ffmpeg_note = QLabel()
+        self.ffmpeg_note.setStyleSheet("color: palette(mid)")
+        actions.addWidget(self.ffmpeg_note)
+        group_layout.addLayout(actions)
+
+        self.set_ffmpeg_widgets(read_ffmpeg_settings())
+        layout.addWidget(self.ffmpeg_group)
+        expanded = bool(read_ui_state().get("ffmpeg_panel_expanded", True))
+        self.ffmpeg_toggle.setChecked(expanded)
+        self.set_ffmpeg_expanded(expanded, save=False)
+        self.ffmpeg_toggle.toggled.connect(self.set_ffmpeg_expanded)
+
+    def set_ffmpeg_expanded(self, expanded: bool, save: bool = True) -> None:
+        self.ffmpeg_body.setVisible(expanded)
+        self.ffmpeg_toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.ffmpeg_toggle.setToolTip("Collapse" if expanded else "Expand")
+        if save:
+            write_ui_state(ffmpeg_panel_expanded=expanded)
+
+    def set_ffmpeg_widgets(self, settings: dict) -> None:
+        for key, (slider, scale) in self.ffmpeg_sliders.items():
+            slider.setValue(round(float(settings[key]) * scale))
+            slider.valueChanged.emit(slider.value())  # refresh label even if unchanged
+        self.ffmpeg_lfe.setChecked(bool(settings["lfe"]))
+        self.ffmpeg_lfe_low.setValue(int(settings["lfe_low"]))
+        self.ffmpeg_lfe_high.setValue(int(settings["lfe_high"]))
+        index = self.ffmpeg_window.findData(int(settings["win_size"]))
+        self.ffmpeg_window.setCurrentIndex(index if index >= 0 else 1)
+
+    def ffmpeg_widget_settings(self) -> dict:
+        settings = {key: slider.value() / scale for key, (slider, scale) in self.ffmpeg_sliders.items()}
+        settings["lfe"] = self.ffmpeg_lfe.isChecked()
+        settings["lfe_low"] = self.ffmpeg_lfe_low.value()
+        settings["lfe_high"] = max(self.ffmpeg_lfe_high.value(), self.ffmpeg_lfe_low.value() + 1)
+        settings["win_size"] = int(self.ffmpeg_window.currentData())
+        return settings
+
+    def update_ffmpeg_visibility(self, _index: int = 0) -> None:
+        self.ffmpeg_group.setVisible(self.route_mode.currentData() in FFMPEG_MODES)
+        if ffmpeg_env_override():
+            self.ffmpeg_note.setText(f"Overridden by STEREO_FFMPEG_SURROUND in {FFMPEG_ENV.name}")
+        else:
+            self.ffmpeg_note.setText("Apply restarts only the decoder (brief gap)")
+
+    def apply_ffmpeg_preset(self, values: dict) -> None:
+        self.set_ffmpeg_widgets({**FFMPEG_DEFAULTS, **values})
+        self.apply_ffmpeg_settings()
+
+    def apply_ffmpeg_settings(self) -> None:
+        try:
+            write_ffmpeg_settings(self.ffmpeg_widget_settings())
+            if service_active(FFMPEG_SERVICE):
+                result = run("systemctl", "--user", "reload", FFMPEG_SERVICE)
+                if result.returncode:
+                    raise RuntimeError(result.stderr.strip() or "The FFmpeg surround engine could not reload.")
+        except Exception as exc:
+            self.fail("Could not apply FFmpeg surround settings", exc)
 
     def fail(self, title: str, exc: Exception | str) -> None:
         QMessageBox.critical(self, title, str(exc))
@@ -588,13 +933,11 @@ class UpmixWindow(QMainWindow):
         self.apply_button.setEnabled(bool(profiles))
         self.refresh_status()
 
-    def refresh_outputs(self, objects: list[dict]) -> None:
-        outputs = physical_outputs(objects)
+    def refresh_outputs(self, outputs: list[tuple[str, str]], selected_name: str) -> None:
         existing = [
             (str(self.output_combo.itemData(index)), self.output_combo.itemText(index))
             for index in range(self.output_combo.count())
         ]
-        selected_name = str(read_route_state().get("sink_name", ""))
         self._updating = True
         if existing != outputs:
             self.output_combo.clear()
@@ -647,8 +990,8 @@ class UpmixWindow(QMainWindow):
             raise RuntimeError("No connected headphone or speaker output was found.")
 
         # HRIR-only applications would lose their sink during replacement.
-        # Park them on hardware briefly; matrix+HRIR applications remain on
-        # the stable matrix input while only its downstream renderer restarts.
+        # Park them on hardware briefly; combined-path applications remain on
+        # their stable upmixer input while only the downstream renderer restarts.
         if routed and mode == "hrir":
             route_streams(hardware, before)
 
@@ -656,28 +999,33 @@ class UpmixWindow(QMainWindow):
         if result.returncode:
             raise RuntimeError(result.stderr.strip() or "The native HRIR/EQ service could not restart.")
 
-        matrix = None
+        upmixer = None
         surround = None
         objects: list[dict] = []
         for _ in range(40):
             objects = pipewire_objects()
-            matrix = next(
-                (node for node in audio_nodes(objects) if node_props(node).get("node.name") == UPMIX_NODE),
-                None,
-            )
+            wanted_upmixer = MODE_UPMIXER[mode]
+            if wanted_upmixer:
+                upmixer = next(
+                    (
+                        node for node in audio_nodes(objects)
+                        if node_props(node).get("node.name") == wanted_upmixer
+                    ),
+                    None,
+                )
             surround = next(
                 (node for node in audio_nodes(objects) if node_props(node).get("node.name") == HRIR_NODE),
                 None,
             )
-            if matrix and surround:
+            if surround and (mode == "hrir" or upmixer):
                 break
             time.sleep(0.1)
-        if not matrix or not surround:
+        if not surround or (mode != "hrir" and not upmixer):
             raise RuntimeError("The processing sinks did not return after the HRIR/EQ restart.")
 
         if routed:
-            target = matrix if mode in {"matrix", "both"} else surround
-            set_volume_state(matrix, 1.0, False)
+            target = upmixer if MODE_UPMIXER[mode] else surround
+            set_volume_state(upmixer, 1.0, False)
             set_volume_state(surround, 1.0, False)
             time.sleep(0.6)
             route_streams(target, pipewire_objects())
@@ -710,45 +1058,75 @@ class UpmixWindow(QMainWindow):
     def apply_routing(self) -> None:
         router_was_active = service_active(ROUTER_SERVICE)
         try:
+            mode = normalized_mode(self.route_mode.currentData())
             if not service_active(UPMIX_SERVICE):
                 set_service(UPMIX_SERVICE, True)
             if not service_active(HRIR_SERVICE):
                 set_service(HRIR_SERVICE, True)
+            if mode in {"active", "active_hrir"}:
+                if not ACTIVE_DECODER.is_file() or not os.access(ACTIVE_DECODER, os.X_OK):
+                    raise RuntimeError(
+                        "The optional FreeSurround decoder is not installed. "
+                        f"Run {APP_DATA / 'active' / 'build-active-decoder'}."
+                    )
+                if not service_active(ACTIVE_SERVICE):
+                    set_service(ACTIVE_SERVICE, True)
+            if mode in {"ffmpeg", "ffmpeg_hrir"}:
+                if not shutil.which("ffmpeg"):
+                    raise RuntimeError("The FFmpeg surround engine requires ffmpeg to be installed.")
+                if not service_active(FFMPEG_SERVICE):
+                    set_service(FFMPEG_SERVICE, True)
+            wanted_upmixer = MODE_UPMIXER[mode]
             matrix = None
+            active = None
+            ffmpeg = None
             surround = None
             objects: list[dict] = []
-            for _ in range(20):
+            for _ in range(50):
                 objects = pipewire_objects()
                 matrix = next(
                     (node for node in audio_nodes(objects) if node_props(node).get("node.name") == UPMIX_NODE),
+                    None,
+                )
+                active = next(
+                    (node for node in audio_nodes(objects) if node_props(node).get("node.name") == ACTIVE_NODE),
+                    None,
+                )
+                ffmpeg = next(
+                    (node for node in audio_nodes(objects) if node_props(node).get("node.name") == FFMPEG_NODE),
                     None,
                 )
                 surround = next(
                     (node for node in audio_nodes(objects) if node_props(node).get("node.name") == HRIR_NODE),
                     None,
                 )
-                if matrix and surround:
+                selected = {UPMIX_NODE: matrix, ACTIVE_NODE: active, FFMPEG_NODE: ffmpeg}.get(wanted_upmixer)
+                if matrix and surround and (wanted_upmixer is None or selected):
                     break
                 time.sleep(0.1)
             if not matrix:
                 raise RuntimeError("The Stereo Matrix sink did not become ready.")
             if not surround:
                 raise RuntimeError("Virtual Surround Manager did not become ready.")
+            if mode in {"active", "active_hrir"} and not active:
+                raise RuntimeError("The FreeSurround Active Decoder sink did not become ready.")
+            if mode in {"ffmpeg", "ffmpeg_hrir"} and not ffmpeg:
+                raise RuntimeError("The FFmpeg surround sink did not become ready.")
 
             current = current_default_sink(objects)
             state = read_route_state()
-            if current and node_props(current).get("node.name") not in (UPMIX_NODE, HRIR_NODE):
+            if current and node_props(current).get("node.name") not in (
+                UPMIX_NODE, ACTIVE_NODE, FFMPEG_NODE, HRIR_NODE
+            ):
                 current_name = node_props(current).get("node.name")
                 state["sink_name"] = current_name
-            mode = normalized_mode(self.route_mode.currentData())
             state["mode"] = mode
             state["enabled"] = True
             state.pop("app_routes", None)
-            target = matrix if mode in {"matrix", "both"} else surround
             hardware = physical_fallback(objects)
             if not hardware:
                 raise RuntimeError("No connected headphone or speaker output was found.")
-            if mode == "matrix":
+            if mode in UPMIXER_ONLY_MODES:
                 physical_channels = sum(
                     1 for item in objects
                     if item.get("type") == "PipeWire:Interface:Port"
@@ -757,17 +1135,19 @@ class UpmixWindow(QMainWindow):
                 )
                 if physical_channels < 8:
                     raise RuntimeError(
-                        "Matrix-only requires a physical output currently exposing 7.1 channels. "
+                        "Upmixer-only mode requires a physical output currently exposing 7.1 channels. "
                         f"The selected device exposes {physical_channels}."
                     )
             self.route_state = state
             ROUTE_STATE.parent.mkdir(parents=True, exist_ok=True)
             ROUTE_STATE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
             set_volume_state(matrix, 1.0, False)
+            set_volume_state(active, 1.0, False)
+            set_volume_state(ffmpeg, 1.0, False)
             set_volume_state(surround, 1.0, False)
             if not router_was_active:
                 set_service(ROUTER_SERVICE, True)
-            target_name = UPMIX_NODE if mode in {"matrix", "both"} else HRIR_NODE
+            target_name = wanted_upmixer or HRIR_NODE
             # Live routing is owned entirely by the persistent router.
             wait_for_audio_node(str(state["sink_name"]))
             result = run("pactl", "set-default-sink", str(state["sink_name"]))
@@ -804,6 +1184,10 @@ class UpmixWindow(QMainWindow):
             time.sleep(0.6)
             if service_active(UPMIX_SERVICE):
                 set_service(UPMIX_SERVICE, False)
+            if service_active(ACTIVE_SERVICE):
+                set_service(ACTIVE_SERVICE, False)
+            if service_active(FFMPEG_SERVICE):
+                set_service(FFMPEG_SERVICE, False)
             if service_active(HRIR_SERVICE):
                 set_service(HRIR_SERVICE, False)
             self.refresh_status()
@@ -883,49 +1267,60 @@ class UpmixWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(HRIR_DIR)))
 
     def refresh_status(self) -> None:
-        upmix_active = service_active(UPMIX_SERVICE)
-        hrir_active = service_active(HRIR_SERVICE)
-        route_state = read_route_state()
-        routed = service_active(ROUTER_SERVICE) and bool(route_state.get("enabled", False))
-        mode = normalized_mode(route_state.get("mode", "both"))
+        """Refresh immediately (after a user action)."""
+        self._status_generation = getattr(self, "_status_generation", 0) + 1
+        self.apply_status(collect_status())
+
+    def refresh_status_async(self) -> None:
+        """Timer refresh: collect off the GUI thread, apply when ready."""
+        if getattr(self, "_status_in_flight", False):
+            return
+        self._status_in_flight = True
+        generation = getattr(self, "_status_generation", 0)
+
+        def work() -> None:
+            try:
+                status = collect_status()
+            except Exception:  # never let a worker crash the app
+                status = None
+            self._status_relay.ready.emit(generation, status)
+
+        threading.Thread(target=work, name="status-refresh", daemon=True).start()
+
+    def _apply_async_status(self, generation: int, status: dict | None) -> None:
+        self._status_in_flight = False
+        # Drop results that started before a newer synchronous refresh.
+        if status is not None and generation == getattr(self, "_status_generation", 0):
+            self.apply_status(status)
+
+    def apply_status(self, status: dict) -> None:
+        route_state = status["route_state"]
         self._updating = True
-        self.processing_toggle.setChecked(routed)
-        selected_index = self.route_mode.findData(mode)
+        self.processing_toggle.setChecked(status["routed"])
+        selected_index = self.route_mode.findData(status["mode"])
         if selected_index >= 0:
             self.route_mode.setCurrentIndex(selected_index)
         self.eq_toggle.setChecked(self.eq_enabled)
         self._updating = False
 
-        selected = read_selected_profile()
-        legacy = any(path.exists() for path in LEGACY_FILES)
-        try:
-            objects = pipewire_objects()
-            self.refresh_outputs(objects)
-            default = current_default_sink(objects)
-            default_name = node_props(default).get("node.name") if default else ""
-            labels = {
-                "both": "matrix → HRIR → physical output",
-                "matrix": "matrix → physical 7.1 output",
-                "hrir": "HRIR → physical stereo output",
-            }
-            route_label = labels[mode] if routed else "direct device passthrough"
-            expected_default = str(route_state.get("sink_name", ""))
-            if default_name and expected_default and default_name != expected_default:
-                route_label += " (physical default mismatch)"
-        except (RuntimeError, ValueError, TypeError, json.JSONDecodeError):
-            route_label = "unknown"
-        self.legacy_button.setEnabled(legacy)
+        if status["outputs"] is not None:
+            self.refresh_outputs(status["outputs"], str(route_state.get("sink_name", "")))
+        nodes = status["nodes"]
+        selected = status["selected"]
+        self.legacy_button.setEnabled(status["legacy"])
         self.status.setText(
-            f"Upmix node: {'ready' if pipewire_node_present(UPMIX_NODE) else 'off'}    |    "
-            f"HRIR node: {'ready' if pipewire_node_present(HRIR_NODE) else 'off'}\n"
+            f"Passive node: {'ready' if UPMIX_NODE in nodes else 'off'}    |    "
+            f"FreeSurround node: {'ready' if ACTIVE_NODE in nodes else 'off'}    |    "
+            f"FFmpeg node: {'ready' if FFMPEG_NODE in nodes else 'off'}    |    "
+            f"HRIR node: {'ready' if HRIR_NODE in nodes else 'off'}\n"
+            f"Active decoder process: {'ready' if status['active_decoder'] else 'off'}    |    "
             f"Integrated EQ: {'enabled' if self.eq_enabled else 'bypassed'}    |    "
-            f"HRIR/EQ process: {'ready' if hrir_active else 'off'}\n"
-            f"Session routing: {route_label}    |    "
+            f"HRIR/EQ process: {'ready' if status['hrir'] else 'off'}\n"
+            f"Session routing: {status['route_label']}    |    "
             f"Physical output: {self.output_combo.currentText() or 'none'}\n"
             f"Profile: {selected.name if selected else 'none'}    |    "
-            f"Legacy global upmix: {'active' if legacy else 'disabled'}"
+            f"Legacy global upmix: {'active' if status['legacy'] else 'disabled'}"
         )
-
 
 def main() -> int:
     app = QApplication(sys.argv)

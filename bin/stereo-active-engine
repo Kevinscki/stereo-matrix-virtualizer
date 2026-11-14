@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# Run one active upmix engine as its own PipeWire path.
+#
+#   stereo-active-engine [freesurround|ffmpeg]
+#
+# Each engine owns distinct sink/output node names, so both can be live at
+# once and the router can switch between them make-before-break.
+#
+# SIGHUP (systemctl --user reload) restarts only the decoder pipeline. The
+# input sink stays up, so applications remain connected while new settings
+# take effect after a short gap.
+set -euo pipefail
+# Job control gives the decoder pipeline its own process group so a reload
+# can stop all of its processes together.
+set -m
+
+readonly ENGINE="${1:-freesurround}"
+
+case "$ENGINE" in
+    freesurround)
+        readonly NAME="stereo-active-upmix"
+        readonly LABEL="FreeSurround"
+        readonly DECODER="${HOME}/.local/libexec/stereo-active-decoder"
+        [[ -x "$DECODER" ]] || {
+            printf 'stereo-active-engine: active decoder is not installed: %s\n' "$DECODER" >&2
+            exit 127
+        }
+        decode() { "$DECODER"; }
+        ;;
+    ffmpeg)
+        readonly NAME="stereo-ffmpeg-upmix"
+        readonly LABEL="FFmpeg Surround"
+        command -v ffmpeg >/dev/null 2>&1 || {
+            printf 'stereo-active-engine: ffmpeg is required for the ffmpeg engine\n' >&2
+            exit 127
+        }
+        readonly SETTINGS="${HOME}/.config/stereo-upmix-manager/ffmpeg-surround.json"
+        surround_args() {
+            # STEREO_FFMPEG_SURROUND (from ffmpeg-surround.env) is a raw
+            # expert override; otherwise the GUI's JSON settings are used.
+            if [[ -n "${STEREO_FFMPEG_SURROUND:-}" ]]; then
+                printf '%s' "$STEREO_FFMPEG_SURROUND"
+                return
+            fi
+            python3 - "$SETTINGS" <<'PYTHON'
+import json, sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, dict):
+        raw = {}
+except (OSError, ValueError):
+    raw = {}
+
+
+def number(key, default, low, high):
+    try:
+        value = float(raw.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return min(high, max(low, value))
+
+
+win_size = int(number("win_size", 2048, 1024, 8192))
+win_size = 1 << (win_size.bit_length() - 1)  # power of two
+lfe_low = int(number("lfe_low", 128, 0, 256))
+lfe_high = int(max(lfe_low + 1, number("lfe_high", 256, 1, 512)))
+surround = number("surround", 1.0, 0.0, 3.0)
+args = [
+    f"win_size={win_size}",
+    f"focus={number('focus', 0.0, -1.0, 1.0):g}",
+    f"angle={number('angle', 90.0, 0.0, 360.0):g}",
+    f"smooth={number('smooth', 0.0, 0.0, 1.0):g}",
+    f"fc_out={number('center', 1.0, 0.0, 3.0):g}",
+    *(f"{channel}_out={surround:g}" for channel in ("sl", "sr", "bl", "br")),
+    f"lfe={'true' if raw.get('lfe', True) else 'false'}",
+    f"lfe_out={number('lfe_level', 1.0, 0.0, 3.0):g}",
+    f"lfe_low={lfe_low}",
+    f"lfe_high={lfe_high}",
+]
+print(":".join(args), end="")
+PYTHON
+        }
+        decode() {
+            local args
+            args=$(surround_args)
+            printf 'stereo-active-engine: surround=%s\n' "$args" >&2
+            # FFmpeg's 7.1 order (FL FR FC LFE BL BR SL SR) matches the
+            # FL,FR,FC,LFE,RL,RR,SL,SR map given to pw-play below.
+            exec ffmpeg -hide_banner -nostats -loglevel fatal \
+                -fflags nobuffer -probesize 32 -analyzeduration 0 \
+                -f f32le -ar 48000 -ch_layout stereo -i pipe:0 \
+                -af "surround=chl_out=7.1:${args}" \
+                -flush_packets 1 -f f32le -ar 48000 -ch_layout 7.1 pipe:1
+        }
+        ;;
+    *)
+        printf 'Usage: %s [freesurround|ffmpeg]\n' "$0" >&2
+        exit 2
+        ;;
+esac
+
+readonly INPUT_NODE="effect_input.${NAME}"
+readonly FEED_NODE="effect_output.${NAME%-upmix}-feed"
+readonly OUTPUT_NODE="effect_output.${NAME}"
+
+for command in pw-loopback pw-record pw-play pw-dump; do
+    command -v "$command" >/dev/null 2>&1 || {
+        printf 'stereo-active-engine: %s is required\n' "$command" >&2
+        exit 127
+    }
+done
+
+loopback_pid=""
+pipeline_pgid=""
+reload_requested=0
+stop_pipeline() {
+    [[ -z "$pipeline_pgid" ]] || kill -TERM -- "-${pipeline_pgid}" 2>/dev/null || true
+}
+cleanup() {
+    stop_pipeline
+    [[ -z "$loopback_pid" ]] || kill "$loopback_pid" 2>/dev/null || true
+}
+terminate() {
+    exit 0
+}
+reload() {
+    reload_requested=1
+    stop_pipeline
+}
+trap cleanup EXIT
+trap terminate INT TERM
+trap reload HUP
+
+pw-loopback \
+    --name="${NAME}-input" \
+    --capture-props="{
+        node.name = \"${INPUT_NODE}\"
+        node.description = \"${LABEL} Active Decoder Input\"
+        media.class = \"Audio/Sink\"
+        audio.position = [ FL FR ]
+    }" \
+    --playback-props="{
+        node.name = \"${FEED_NODE}\"
+        node.description = \"${LABEL} Stereo Feed\"
+        node.passive = true
+        node.autoconnect = false
+        node.dont-reconnect = true
+        audio.position = [ FL FR ]
+    }" &
+loopback_pid=$!
+
+for _ in $(seq 1 50); do
+    pw-dump | grep -F "\"${FEED_NODE}\"" >/dev/null && break
+    kill -0 "$loopback_pid" 2>/dev/null || {
+        wait "$loopback_pid"
+        exit $?
+    }
+    sleep 0.1
+done
+pw-dump | grep -F "\"${FEED_NODE}\"" >/dev/null || {
+    printf 'stereo-active-engine: stereo feed node did not become ready\n' >&2
+    exit 1
+}
+
+while true; do
+    reload_requested=0
+    pw-record \
+        --target "$FEED_NODE" --latency 20ms \
+        --rate 48000 --channels 2 --channel-map FL,FR --format f32 --raw - |
+        decode |
+        pw-play \
+            --target 0 --latency 20ms \
+            --properties="{ node.name = \"${OUTPUT_NODE}\" node.description = \"${LABEL} Active 7.1 Output\" node.autoconnect = false node.dont-reconnect = true }" \
+            --rate 48000 --channels 8 --channel-map FL,FR,FC,LFE,RL,RR,SL,SR \
+            --format f32 --raw - &
+    play_pid=$!
+    pipeline_pgid=$(ps -o pgid= -p "$play_pid" | tr -d ' ')
+
+    # A trapped signal interrupts wait; keep waiting until pw-play has exited.
+    status=0
+    while true; do
+        status=0
+        wait "$play_pid" || status=$?
+        kill -0 "$play_pid" 2>/dev/null || break
+    done
+    stop_pipeline
+    pipeline_pgid=""
+
+    if ((reload_requested)); then
+        printf 'stereo-active-engine: reloading %s decoder\n' "$ENGINE" >&2
+        continue
+    fi
+    exit "$status"
+done

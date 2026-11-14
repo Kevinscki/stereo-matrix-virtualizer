@@ -1,6 +1,6 @@
 [Unit]
 Description=Enforce the selected stereo-upmix application route
-After=pipewire.service wireplumber.service stereo-upmix-manager.service virtual-surround-manager.service
+After=pipewire.service wireplumber.service stereo-upmix-manager.service stereo-active-decoder.service stereo-ffmpeg-upmix.service virtual-surround-manager.service
 BindsTo=pipewire.service
 
 [Service]

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-readonly CONFIG_DIR="${HOME}/.config/stereo-matrix-virtualizer"
+readonly CONFIG_DIR="${HOME}/.config/stereo-upmix-manager"
 readonly DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/stereo-matrix-virtualizer"
 
 missing=()
@@ -39,19 +39,40 @@ elif (($#)); then
 fi
 
 install -Dm755 "$ROOT_DIR/bin/stereo-upmix-engine" "$HOME/.local/libexec/stereo-upmix-engine"
+install -Dm755 "$ROOT_DIR/bin/stereo-active-engine" "$HOME/.local/libexec/stereo-active-engine"
 install -Dm755 "$ROOT_DIR/bin/stereo-upmix-build-filter" "$HOME/.local/libexec/stereo-upmix-build-filter"
 install -Dm755 "$ROOT_DIR/bin/stereo-upmix-router" "$HOME/.local/libexec/stereo-upmix-router"
 install -Dm755 "$ROOT_DIR/bin/stereo-upmix-manager" "$HOME/.local/bin/stereo-upmix-manager"
 install -Dm644 "$ROOT_DIR/systemd/stereo-upmix-manager.service" "$HOME/.config/systemd/user/stereo-upmix-manager.service"
+install -Dm644 "$ROOT_DIR/systemd/stereo-active-decoder.service" "$HOME/.config/systemd/user/stereo-active-decoder.service"
+install -Dm644 "$ROOT_DIR/systemd/stereo-ffmpeg-upmix.service" "$HOME/.config/systemd/user/stereo-ffmpeg-upmix.service"
 install -Dm644 "$ROOT_DIR/systemd/stereo-upmix-router.service" "$HOME/.config/systemd/user/stereo-upmix-router.service"
 install -Dm644 "$ROOT_DIR/systemd/virtual-surround-manager.service" "$HOME/.config/systemd/user/virtual-surround-manager.service"
 install -Dm644 "$ROOT_DIR/desktop/stereo-upmix-manager.desktop" "$HOME/.local/share/applications/stereo-upmix-manager.desktop"
 mkdir -p "$CONFIG_DIR" "$DATA_DIR/hrir"
+install -Dm755 "$ROOT_DIR/active/build-active-decoder" "$DATA_DIR/active/build-active-decoder"
+install -Dm644 "$ROOT_DIR/active/stereo-active-decoder.cpp" "$DATA_DIR/active/stereo-active-decoder.cpp"
+install -Dm644 "$ROOT_DIR/active/README.md" "$DATA_DIR/active/README.md"
+
+if [[ ! -x "$HOME/.local/libexec/stereo-active-decoder" ]]; then
+    if command -v cc >/dev/null 2>&1 && command -v c++ >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then
+        if ! "$ROOT_DIR/active/build-active-decoder"; then
+            printf 'Warning: optional FreeSurround active decoder could not be built.\n' >&2
+            printf 'Passive matrix and HRIR modes are installed and unaffected.\n' >&2
+        fi
+    else
+        printf 'Optional active decoder not built (cc, c++ and git are required).\n' >&2
+    fi
+fi
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    printf 'Optional FFmpeg surround engine unavailable until ffmpeg is installed.\n' >&2
+fi
 
 systemctl --user daemon-reload
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 
 printf 'Installed Stereo Matrix Virtualizer.\n'
 printf 'Place compatible HRIR WAV files in: %s\n' "$DATA_DIR/hrir"
-printf 'Existing Virtual Surround Manager HRIR files are discovered automatically.\n'
+printf 'Active decoder builder: %s\n' "$DATA_DIR/active/build-active-decoder"
 printf 'Launch from the application menu or run: %s\n' "$HOME/.local/bin/stereo-upmix-manager"

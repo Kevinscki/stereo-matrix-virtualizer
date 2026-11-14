@@ -10,14 +10,32 @@ import time
 from pathlib import Path
 
 
-STATE = Path.home() / ".config/stereo-matrix-virtualizer/route.json"
+STATE = Path.home() / ".config/stereo-upmix-manager/route.json"
 MATRIX = "effect_input.stereo-matrix-upmix"
 MATRIX_OUTPUT = "effect_output.stereo-matrix-upmix"
+ACTIVE = "effect_input.stereo-active-upmix"
+ACTIVE_OUTPUT = "effect_output.stereo-active-upmix"
+FFMPEG = "effect_input.stereo-ffmpeg-upmix"
+FFMPEG_OUTPUT = "effect_output.stereo-ffmpeg-upmix"
 SURROUND = "effect_input.virtual-surround-manager"
 SURROUND_OUTPUT = "effect_output.virtual-surround-manager"
 CHANNELS_7_1 = ("FL", "FR", "FC", "LFE", "RL", "RR", "SL", "SR")
 CHANNELS_STEREO = ("FL", "FR")
-MODES = {"matrix", "hrir", "both"}
+UPMIXERS = {
+    "matrix": (MATRIX, MATRIX_OUTPUT),
+    "active": (ACTIVE, ACTIVE_OUTPUT),
+    "ffmpeg": (FFMPEG, FFMPEG_OUTPUT),
+}
+MODE_PATHS = {
+    "both": ("matrix", True),
+    "matrix": ("matrix", False),
+    "active_hrir": ("active", True),
+    "active": ("active", False),
+    "ffmpeg_hrir": ("ffmpeg", True),
+    "ffmpeg": ("ffmpeg", False),
+    "hrir": (None, True),
+}
+MODES = set(MODE_PATHS)
 
 
 def run(*args: str) -> subprocess.CompletedProcess[str]:
@@ -248,7 +266,7 @@ def main() -> None:
 
         # The processing sinks are application targets, never hardware
         # defaults. Repair KDE/WirePlumber choosing one as the system default.
-        if default_name in {MATRIX, SURROUND}:
+        if default_name in {MATRIX, ACTIVE, FFMPEG, SURROUND}:
             run("pactl", "set-default-sink", str(props(hardware).get("node.name", "")))
 
         if not bool(state.get("enabled", False)):
@@ -256,36 +274,47 @@ def main() -> None:
             time.sleep(0.5)
             continue
 
-        matrix = node_named(nodes, MATRIX)
+        # Mode -> (upmixer key or None, render through HRIR?)
+        upmixer_key, use_hrir = MODE_PATHS[mode]
         surround = node_named(nodes, SURROUND)
-        if not matrix or not surround:
+        sinks = {key: node_named(nodes, names[0]) for key, names in UPMIXERS.items()}
+        outputs = {key: node_named(nodes, names[1]) for key, names in UPMIXERS.items()}
+
+        if upmixer_key and (not sinks[upmixer_key] or not outputs[upmixer_key]):
+            time.sleep(0.5)
+            continue
+        if use_hrir and not surround:
             time.sleep(0.5)
             continue
 
-        hrir_output_ready = ensure_route(
-            node_named(nodes, SURROUND_OUTPUT), hardware, CHANNELS_STEREO, ports, links
-        )
-        if not hrir_output_ready:
-            time.sleep(0.5)
-            continue
+        if use_hrir:
+            hrir_output_ready = ensure_route(
+                node_named(nodes, SURROUND_OUTPUT), hardware, CHANNELS_STEREO, ports, links
+            )
+            if not hrir_output_ready:
+                time.sleep(0.5)
+                continue
 
-        matrix_output = node_named(nodes, MATRIX_OUTPUT)
-        if mode == "both":
-            # Prepare Matrix -> HRIR completely before moving applications.
-            if ensure_route(matrix_output, surround, CHANNELS_7_1, ports, links):
-                route_applications(matrix, nodes, ports, links)
-        elif mode == "matrix":
-            # Matrix-only is valid only for a real 7.1 hardware destination.
-            if ensure_route(matrix_output, hardware, CHANNELS_7_1, ports, links):
-                route_applications(matrix, nodes, ports, links)
+        if upmixer_key:
+            # Prepare the selected upmixer -> HRIR (or 7.1 hardware) route
+            # completely before moving applications away from the last
+            # known-good input. Upmixer-only modes need real 7.1 hardware.
+            upmixer = sinks[upmixer_key]
+            destination = surround if use_hrir else hardware
+            ready = ensure_route(outputs[upmixer_key], destination, CHANNELS_7_1, ports, links)
+            target = upmixer if ready else None
         else:
-            # Move applications to the already-live HRIR path first. Only once
-            # the new route is observed do we disconnect the idle Matrix output.
-            route_applications(surround, nodes, ports, links)
-            if applications_routed(surround, nodes, links):
-                matrix_output_id = node_id(matrix_output)
-                if matrix_output_id is not None:
-                    disconnect_output(matrix_output_id, None, links)
+            # Move applications to the already-live HRIR path first.
+            target = surround
+
+        if target is not None:
+            route_applications(target, nodes, ports, links)
+            if applications_routed(target, nodes, links):
+                # Only once the new route is observed, disconnect idle upmixers.
+                for key, idle_output in outputs.items():
+                    idle_output_id = node_id(idle_output)
+                    if key != upmixer_key and idle_output_id is not None:
+                        disconnect_output(idle_output_id, None, links)
 
         time.sleep(0.5)
 
